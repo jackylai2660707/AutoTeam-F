@@ -222,16 +222,16 @@ class MaillabClient(MailProvider):
 
         domain 解析优先级:
           1. 显式参数
-          2. runtime_config.json
+          2. runtime_config/env 中的注册域名池 round-robin
           3. 环境变量 MAILLAB_DOMAIN / CLOUDMAIL_DOMAIN(后者作为兼容回落)
         """
         if domain:
             domain_clean = domain.lstrip("@").strip()
         else:
             try:
-                from autoteam.runtime_config import get_register_domain
+                from autoteam.runtime_config import get_next_register_domain
 
-                domain_clean = (get_register_domain() or "").lstrip("@").strip()
+                domain_clean = (get_next_register_domain() or "").lstrip("@").strip()
             except Exception:
                 domain_clean = ""
             if not domain_clean:

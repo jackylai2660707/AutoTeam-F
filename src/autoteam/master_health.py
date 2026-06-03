@@ -46,6 +46,20 @@ DEFAULT_PROBE_TIMEOUT = 10.0
 # spec §3.3 — owner-eligible 角色白名单
 _OWNER_ROLES = ("account-owner", "admin", "org-admin", "workspace-owner")
 
+# JWT chatgpt_plan_type values that still represent a usable paid workspace for
+# the master account. Keep this separate from child account plan support: child
+# OAuth/quota handling has stricter requirements.
+_PAID_WORKSPACE_PLAN_TYPES = frozenset({
+    "team",
+    "business",
+    "enterprise",
+    "edu",
+})
+
+_ACTIVE_USAGE_BASED_WORKSPACE_PLAN_TYPES = frozenset({
+    "self_serve_business_usage_based",
+})
+
 # spec §2.3 — raw_account_item 落盘白名单(避免 token 入盘)
 _RAW_ITEM_PERSIST_KEYS = (
     "id",
@@ -249,10 +263,17 @@ def _classify_l1(
             }
         # Round 11 二轮 — grace_until 解不出(web session JWT 路径,只含 chatgpt_plan_type
         # 而无 chatgpt_subscription_active_until):用 chatgpt_plan_type fallback
-        # 当前权益仍为付费层 → 视为 grace 期内 healthy=True
+        # Usage-based Business workspaces expose eligible_for_auto_reactivation=true
+        # even when the subscription is active. Treat them as active, not cancelled.
         plan_type = extract_plan_type_from_jwt(id_token) if id_token else None
-        _PAID_PLAN_TYPES = ("team", "business", "enterprise", "edu")
-        if plan_type in _PAID_PLAN_TYPES:
+        if plan_type in _ACTIVE_USAGE_BASED_WORKSPACE_PLAN_TYPES:
+            return True, "active", {
+                "current_user_role": role,
+                "raw_item": target,
+                "plan_type_jwt": plan_type,
+            }
+        # 当前权益仍为付费层 → 视为 grace 期内 healthy=True
+        if plan_type in _PAID_WORKSPACE_PLAN_TYPES:
             return True, "subscription_grace", {
                 "current_user_role": role,
                 "raw_item": target,
@@ -722,6 +743,7 @@ def _apply_master_degraded_classification(
         STATUS_DEGRADED_GRACE,
         STATUS_EXHAUSTED,
         STATUS_STANDBY,
+        _is_main_account_email,
         load_accounts,
         update_account,
     )
@@ -739,6 +761,7 @@ def _apply_master_degraded_classification(
     # 1. master health probe(走 cache)
     api_owns = False
     api = chatgpt_api
+    current_team_emails: set[str] = set()
     try:
         if not _chatgpt_api_ready(api):
             try:
@@ -766,6 +789,29 @@ def _apply_master_degraded_classification(
             logger.warning(
                 "[master_health] retroactive helper: pool signal failed: %s", exc,
             )
+
+        if not dry_run and _chatgpt_api_ready(api):
+            try:
+                probe_aid = (evidence or {}).get("account_id") or workspace_id
+                if not probe_aid:
+                    try:
+                        from autoteam.admin_state import get_chatgpt_account_id
+
+                        probe_aid = get_chatgpt_account_id() or ""
+                    except Exception:
+                        probe_aid = ""
+                if probe_aid:
+                    resp = api._api_fetch("GET", f"/backend-api/accounts/{probe_aid}/users")
+                    if resp.get("status") == 200:
+                        payload = json.loads(resp.get("body") or "{}")
+                        members = payload.get("items", payload.get("users", payload.get("members", [])))
+                        current_team_emails = {
+                            str(m.get("email") or "").strip().lower()
+                            for m in members
+                            if str(m.get("email") or "").strip()
+                        }
+            except Exception as exc:
+                logger.warning("[retroactive] 读取当前 Team 成员失败，跳过 Team 成员保护: %s", exc)
     finally:
         if api_owns and api is not None:
             try:
@@ -841,11 +887,31 @@ def _apply_master_degraded_classification(
     for acc in accounts_now:
         try:
             email = acc.get("email")
+            email_l = str(email or "").strip().lower()
             cur_status = acc.get("status")
             cur_ws = acc.get("workspace_account_id") or ""
 
+            # This helper handles degraded child seats. The owner itself should not be
+            # reclassified as a reusable standby child, and current remote Team members
+            # are not stale even if the master health probe reports a cancelled signal.
+            if _is_main_account_email(email_l):
+                continue
+
             # GRACE 到期检查:无论 workspace 是否一致,先处理已经标 GRACE 的
             if cur_status == STATUS_DEGRADED_GRACE:
+                if email_l in current_team_emails:
+                    if dry_run:
+                        out["reverted_active"].append(email)
+                    else:
+                        update_account(
+                            email,
+                            status=STATUS_ACTIVE,
+                            grace_until=None,
+                            grace_marked_at=None,
+                            master_account_id_at_grace=None,
+                        )
+                        out["reverted_active"].append(email)
+                    continue
                 acc_grace_until = acc.get("grace_until")
                 if acc_grace_until and now_ts >= float(acc_grace_until):
                     if dry_run:
@@ -865,6 +931,8 @@ def _apply_master_degraded_classification(
             if cur_status not in (STATUS_ACTIVE, STATUS_EXHAUSTED):
                 continue
             if cur_ws != master_aid:
+                continue
+            if email_l in current_team_emails:
                 continue
 
             # 解析 grace_until — 优先用入参,否则从 auth_file id_token 解

@@ -17,10 +17,16 @@ from autoteam.textio import read_text, write_text
 logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).parent.parent.parent
-RUNTIME_CONFIG_FILE = PROJECT_ROOT / "runtime_config.json"
+DATA_DIR = PROJECT_ROOT / "data"
+RUNTIME_CONFIG_FILE = Path(
+    os.environ.get(
+        "AUTOTEAM_RUNTIME_CONFIG_FILE",
+        str((DATA_DIR / "runtime_config.json") if DATA_DIR.exists() else (PROJECT_ROOT / "runtime_config.json")),
+    )
+)
 RUNTIME_CONFIG_MODE = 0o666
 
-_LOCK = threading.Lock()
+_LOCK = threading.RLock()
 
 
 def _load():
@@ -46,6 +52,7 @@ def _load():
 
 def _save(data):
     target = RUNTIME_CONFIG_FILE.resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
     write_text(target, json.dumps(data, indent=2, ensure_ascii=False))
     try:
         os.chmod(target, RUNTIME_CONFIG_MODE)
@@ -67,23 +74,163 @@ def set_value(key, value):
 
 
 def get_register_domain():
-    """返回用于子号注册的 CloudMail 域名。
+    """返回用于子号注册的第一个 CloudMail 域名。
 
-    优先级：runtime_config.json → 环境变量 CLOUDMAIL_DOMAIN（向后兼容）。
+    优先级：runtime_config.register_domains → runtime_config.register_domain →
+    环境变量 CLOUDMAIL_DOMAINS → 环境变量 CLOUDMAIL_DOMAIN（向后兼容）。
     返回值已 lstrip "@"。
     """
-    from autoteam.config import CLOUDMAIL_DOMAIN
+    domains = get_register_domains()
+    return domains[0] if domains else ""
 
-    override = (get("register_domain") or "").strip()
-    if override:
-        return override.lstrip("@").strip()
-    return (CLOUDMAIL_DOMAIN or "").lstrip("@").strip()
+
+def _split_csvish(value) -> list[str]:
+    if isinstance(value, (list, tuple)):
+        raw_items = value
+    else:
+        raw_items = str(value or "").replace("\n", ",").replace(";", ",").split(",")
+    return [str(item).strip() for item in raw_items if str(item).strip()]
+
+
+def _clean_domain(value: str | None) -> str:
+    return str(value or "").strip().lstrip("@").strip()
+
+
+def get_register_domains() -> list[str]:
+    """返回注册域名池；保留顺序并去重。"""
+    from autoteam.config import CLOUDMAIL_DOMAIN, CLOUDMAIL_DOMAINS
+
+    data = get("register_domains")
+    candidates = _split_csvish(data)
+
+    if not candidates:
+        single_override = (get("register_domain") or "").strip()
+        if single_override:
+            candidates = _split_csvish(single_override)
+
+    if not candidates:
+        candidates = _split_csvish(CLOUDMAIL_DOMAINS)
+
+    if not candidates:
+        candidates = _split_csvish(CLOUDMAIL_DOMAIN)
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in candidates:
+        domain = _clean_domain(item)
+        key = domain.lower()
+        if domain and key not in seen:
+            out.append(domain)
+            seen.add(key)
+    return out
+
+
+def get_next_register_domain() -> str:
+    """按 round-robin 取下一个注册域名；单域名时等同 get_register_domain()."""
+    with _LOCK:
+        domains = get_register_domains()
+        if not domains:
+            return ""
+        if len(domains) == 1:
+            return domains[0]
+        data = _load()
+        try:
+            previous = int(data.get("_register_domain_index", -1))
+        except (TypeError, ValueError):
+            previous = -1
+        index = (previous + 1) % len(domains)
+        data["_register_domain_index"] = index
+        _save(data)
+        return domains[index]
 
 
 def set_register_domain(domain):
     """写入 register_domain 覆盖值。空串表示清除 override 走环境变量。"""
     cleaned = (domain or "").strip().lstrip("@").strip()
-    set_value("register_domain", cleaned)
+    with _LOCK:
+        data = _load()
+        data["register_domain"] = cleaned
+        data.pop("register_domains", None)
+        data.pop("_register_domain_index", None)
+        _save(data)
+    return cleaned
+
+
+def set_register_domains(domains):
+    """写入注册域名池。空列表表示清除 override 走环境变量。"""
+    cleaned = []
+    seen = set()
+    for item in _split_csvish(domains):
+        domain = _clean_domain(item)
+        key = domain.lower()
+        if domain and key not in seen:
+            cleaned.append(domain)
+            seen.add(key)
+    with _LOCK:
+        data = _load()
+        if cleaned:
+            data["register_domains"] = cleaned
+            data.pop("register_domain", None)
+        else:
+            data.pop("register_domains", None)
+        data.pop("_register_domain_index", None)
+        _save(data)
+    return cleaned
+
+
+def get_playwright_proxy_urls() -> list[str]:
+    """返回子号注册/OAuth 使用的代理池。为空时沿用全局/直连旧行为。"""
+    from autoteam.config import PLAYWRIGHT_PROXY_URLS
+
+    data = get("playwright_proxy_urls")
+    candidates = _split_csvish(data) if data else _split_csvish(PLAYWRIGHT_PROXY_URLS)
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in candidates:
+        proxy = str(item or "").strip()
+        if proxy and proxy not in seen:
+            out.append(proxy)
+            seen.add(proxy)
+    return out
+
+
+def get_next_playwright_proxy_url() -> str:
+    """按 round-robin 取下一个子号注册/OAuth 代理。"""
+    with _LOCK:
+        proxies = get_playwright_proxy_urls()
+        if not proxies:
+            return ""
+        if len(proxies) == 1:
+            return proxies[0]
+        data = _load()
+        try:
+            previous = int(data.get("_playwright_proxy_index", -1))
+        except (TypeError, ValueError):
+            previous = -1
+        index = (previous + 1) % len(proxies)
+        data["_playwright_proxy_index"] = index
+        _save(data)
+        return proxies[index]
+
+
+def set_playwright_proxy_urls(proxies):
+    """写入子号注册/OAuth 代理池。空列表表示清除 override 走环境变量。"""
+    cleaned = []
+    seen = set()
+    for item in _split_csvish(proxies):
+        proxy = str(item or "").strip()
+        if proxy and proxy not in seen:
+            cleaned.append(proxy)
+            seen.add(proxy)
+    with _LOCK:
+        data = _load()
+        if cleaned:
+            data["playwright_proxy_urls"] = cleaned
+        else:
+            data.pop("playwright_proxy_urls", None)
+        data.pop("_playwright_proxy_index", None)
+        _save(data)
     return cleaned
 
 

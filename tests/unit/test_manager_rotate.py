@@ -29,8 +29,9 @@ def test_cmd_rotate_skips_google_accounts_during_auto_reuse(monkeypatch):
     events = []
 
     monkeypatch.setattr(config, "ROTATE_SKIP_REUSE", False)
+    monkeypatch.setattr(manager, "_select_reuse_candidates", lambda accounts, threshold, **kwargs: list(accounts))
     monkeypatch.setattr(manager, "sync_account_states", lambda: events.append(("sync_account_states", None)))
-    monkeypatch.setattr(manager, "cmd_check", lambda: events.append(("cmd_check", None)))
+    monkeypatch.setattr(manager, "cmd_check", lambda **kwargs: events.append(("cmd_check", None)))
     monkeypatch.setattr(manager, "ChatGPTTeamAPI", lambda: chatgpt)
     monkeypatch.setattr(manager, "CloudMailClient", lambda: _FakeMailClient())
     monkeypatch.setattr(manager, "load_accounts", lambda: [])
@@ -71,7 +72,7 @@ def test_cmd_rotate_can_defer_final_sync_when_running_as_api_task(monkeypatch):
     events = []
 
     monkeypatch.setattr(manager, "sync_account_states", lambda: events.append(("sync_account_states", None)))
-    monkeypatch.setattr(manager, "cmd_check", lambda: events.append(("cmd_check", None)))
+    monkeypatch.setattr(manager, "cmd_check", lambda **kwargs: events.append(("cmd_check", None)))
     monkeypatch.setattr(manager, "ChatGPTTeamAPI", lambda: chatgpt)
     monkeypatch.setattr(manager, "CloudMailClient", lambda: _FakeMailClient())
     monkeypatch.setattr(manager, "load_accounts", lambda: [])
@@ -103,6 +104,43 @@ def test_cmd_rotate_can_defer_final_sync_when_running_as_api_task(monkeypatch):
     ]
 
 
+def test_cmd_rotate_forwards_force_auth_repair_to_cmd_check(monkeypatch):
+    chatgpt = _FakeChatGPT()
+    events = []
+
+    monkeypatch.setattr(manager, "sync_account_states", lambda: events.append(("sync_account_states", None)))
+    monkeypatch.setattr(manager, "cmd_check", lambda **kwargs: events.append(("cmd_check", kwargs)))
+    monkeypatch.setattr(manager, "ChatGPTTeamAPI", lambda: chatgpt)
+    monkeypatch.setattr(manager, "CloudMailClient", lambda: _FakeMailClient())
+    monkeypatch.setattr(manager, "load_accounts", lambda: [])
+    monkeypatch.setattr(manager, "get_team_member_count", lambda _chatgpt: 3)
+    monkeypatch.setattr(manager, "_count_pool_active_accounts", lambda *args, **kwargs: 2)
+    monkeypatch.setattr(manager, "get_standby_accounts", lambda: [])
+    monkeypatch.setattr(manager, "sync_to_cpa", lambda: events.append(("sync_to_cpa", None)))
+
+    manager.cmd_rotate(target_seats=3, force_auth_repair=True)
+
+    assert events == [
+        ("sync_account_states", None),
+        ("cmd_check", {"force_auth_repair": True}),
+        ("sync_to_cpa", None),
+    ]
+
+
+def test_can_cancel_pending_invite_for_stale_auth_protected_pending(monkeypatch):
+    monkeypatch.setattr(manager, "_is_main_account_email", lambda _email: False)
+    monkeypatch.setattr(manager, "_has_auth_file", lambda _acc: True)
+    monkeypatch.setattr(manager, "_check_and_refresh", lambda _acc: ("auth_error", {}))
+
+    ok, reason = manager._can_cancel_pending_invite(
+        "stale@example.com",
+        {"email": "stale@example.com", "status": manager.STATUS_AUTH_INVALID},
+    )
+
+    assert ok is True
+    assert reason == "stale_auth_protected_pending"
+
+
 def test_replaceable_pool_blocker_reason_reports_concrete_evidence():
     assert (
         manager._replaceable_pool_blocker_reason(
@@ -131,6 +169,7 @@ def test_create_new_account_uses_domain_auto_join_before_invite(monkeypatch):
     monkeypatch.setenv("ROTATE_NEW_ACCOUNT_MODE", "domain_auto_join_first")
     monkeypatch.setenv("AUTOTEAM_AUTO_JOIN_DOMAINS", "example.com")
     monkeypatch.setattr(manager, "get_mail_domain", lambda: "@example.com")
+    monkeypatch.setattr(manager, "_check_pending_invites", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(manager, "_prepare_remote_capacity_for_new_seat", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(
         manager,
@@ -151,6 +190,7 @@ def test_create_new_account_invite_first_mode_preserves_invite_order(monkeypatch
     events = []
 
     monkeypatch.setenv("ROTATE_NEW_ACCOUNT_MODE", "invite_first")
+    monkeypatch.setattr(manager, "_check_pending_invites", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(manager, "create_account_via_invite", lambda *_args, **_kwargs: events.append("invite") or "new@example.com")
     monkeypatch.setattr(
         manager,
@@ -172,6 +212,7 @@ def test_create_new_account_domain_auto_join_falls_back_to_invite(monkeypatch):
     monkeypatch.setenv("AUTOTEAM_AUTO_JOIN_DOMAINS", "example.com")
     monkeypatch.setenv("ROTATE_DOMAIN_AUTO_JOIN_FALLBACK_INVITE", "true")
     monkeypatch.setattr(manager, "get_mail_domain", lambda: "@example.com")
+    monkeypatch.setattr(manager, "_check_pending_invites", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(manager, "_prepare_remote_capacity_for_new_seat", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(manager, "create_account_direct", lambda *_args, **_kwargs: events.append("direct") or None)
     monkeypatch.setattr(manager, "create_account_via_invite", lambda *_args, **_kwargs: events.append("invite") or "new@example.com")
@@ -189,6 +230,7 @@ def test_create_new_account_does_not_retry_direct_after_invite_fallback_failure(
     monkeypatch.setenv("ROTATE_NEW_ACCOUNT_MODE", "domain_auto_join_first")
     monkeypatch.setenv("AUTOTEAM_AUTO_JOIN_DOMAINS", "example.com")
     monkeypatch.setattr(manager, "get_mail_domain", lambda: "@example.com")
+    monkeypatch.setattr(manager, "_check_pending_invites", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(manager, "_prepare_remote_capacity_for_new_seat", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(manager, "create_account_direct", lambda *_args, **_kwargs: events.append("direct") or None)
     monkeypatch.setattr(manager, "create_account_via_invite", lambda *_args, **_kwargs: events.append("invite") or None)
@@ -204,6 +246,7 @@ def test_create_new_account_domain_auto_join_respects_allowlist(monkeypatch):
     monkeypatch.setenv("ROTATE_NEW_ACCOUNT_MODE", "domain_auto_join_first")
     monkeypatch.setenv("AUTOTEAM_AUTO_JOIN_DOMAINS", "other.example")
     monkeypatch.setattr(manager, "get_mail_domain", lambda: "@example.com")
+    monkeypatch.setattr(manager, "_check_pending_invites", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(
         manager,
         "create_account_direct",
@@ -227,7 +270,7 @@ def test_cmd_rotate_removes_replaceable_blocker_before_creating_replacement(monk
 
     monkeypatch.setattr(config, "ROTATE_SKIP_REUSE", True)
     monkeypatch.setattr(manager, "sync_account_states", lambda: events.append(("sync_account_states", None)))
-    monkeypatch.setattr(manager, "cmd_check", lambda: events.append(("cmd_check", None)))
+    monkeypatch.setattr(manager, "cmd_check", lambda **kwargs: events.append(("cmd_check", None)))
     monkeypatch.setattr(manager, "ChatGPTTeamAPI", lambda: chatgpt)
     monkeypatch.setattr(manager, "CloudMailClient", lambda: _FakeMailClient())
     monkeypatch.setattr(manager, "load_accounts", lambda: accounts)
@@ -338,8 +381,9 @@ def test_cmd_rotate_target2_refills_after_exhausted_removal_despite_transient_ov
         return True
 
     monkeypatch.setattr(config, "ROTATE_SKIP_REUSE", False)
+    monkeypatch.setattr(manager, "_select_reuse_candidates", lambda accounts, threshold, **kwargs: list(accounts))
     monkeypatch.setattr(manager, "sync_account_states", lambda: events.append(("sync_account_states", None)))
-    monkeypatch.setattr(manager, "cmd_check", lambda: events.append(("cmd_check", None)))
+    monkeypatch.setattr(manager, "cmd_check", lambda **kwargs: events.append(("cmd_check", None)))
     monkeypatch.setattr(manager, "ChatGPTTeamAPI", lambda: chatgpt)
     monkeypatch.setattr(manager, "CloudMailClient", lambda: _FakeMailClient())
     monkeypatch.setattr(manager, "load_accounts", fake_load_accounts)
@@ -373,3 +417,174 @@ def test_cmd_rotate_target2_refills_after_exhausted_removal_despite_transient_ov
     assert next(acc for acc in state["accounts"] if acc["email"] == "standby@example.com")[
         "status"
     ] == manager.STATUS_ACTIVE
+
+
+def test_replace_single_waits_for_remote_capacity_before_deciding_fill(monkeypatch):
+    chatgpt = _FakeChatGPT()
+    mail = _FakeMailClient()
+    events = []
+
+    def fake_remove(_chatgpt, email, *, return_status=False, **_kwargs):
+        events.append(("remove", email, return_status))
+        return "removed" if return_status else True
+
+    def fake_update(email, **kwargs):
+        events.append(("update", email, kwargs.get("status")))
+
+    def fake_wait(_chatgpt, **kwargs):
+        events.append(("wait_capacity", kwargs["removed_email"], kwargs["target"]))
+        return 2, True
+
+    def fake_create(_chatgpt, _mail):
+        events.append(("create", None))
+        return "fresh@example.com"
+
+    monkeypatch.setattr(manager, "remove_from_team", fake_remove)
+    monkeypatch.setattr(manager, "update_account", fake_update)
+    monkeypatch.setattr(manager, "_wait_for_remote_capacity_after_removal", fake_wait)
+    monkeypatch.setattr(
+        manager,
+        "get_team_member_count",
+        lambda _chatgpt: (_ for _ in ()).throw(AssertionError("should rely on waited capacity result")),
+    )
+    monkeypatch.setattr(manager, "get_standby_accounts", lambda: [])
+    monkeypatch.setattr(manager, "create_new_account", fake_create)
+
+    out = manager._replace_single(chatgpt, mail, "old@example.com", reason="auto-check")
+
+    assert out["kicked"] is True
+    assert out["filled_by"] == "fresh@example.com"
+    assert out["method"] == "new"
+    assert ("wait_capacity", "old@example.com", 3) in events
+    assert ("create", None) in events
+
+
+def test_replace_single_allows_historical_reuse_when_old_team_token_auth_errors(monkeypatch, tmp_path):
+    chatgpt = _FakeChatGPT()
+    mail = _FakeMailClient()
+    old_auth = tmp_path / "old.json"
+    standby_auth = tmp_path / "standby-team.json"
+    old_auth.write_text('{"access_token":"old"}', encoding="utf-8")
+    standby_auth.write_text('{"access_token":"standby"}', encoding="utf-8")
+    events = []
+
+    def fake_remove(_chatgpt, email, *, return_status=False, **_kwargs):
+        events.append(("remove", email, return_status))
+        return "removed" if return_status else True
+
+    def fake_update(email, **kwargs):
+        events.append(("update", email, kwargs.get("status")))
+
+    def fake_wait(_chatgpt, **kwargs):
+        events.append(("wait_capacity", kwargs["removed_email"], kwargs["target"]))
+        return 2, True
+
+    monkeypatch.setattr(manager, "remove_from_team", fake_remove)
+    monkeypatch.setattr(manager, "update_account", fake_update)
+    monkeypatch.setattr(manager, "_wait_for_remote_capacity_after_removal", fake_wait)
+    monkeypatch.setattr(
+        manager,
+        "get_standby_accounts",
+        lambda: [
+            {
+                "email": "standby@example.com",
+                "_quota_recovered": True,
+                "auth_file": str(standby_auth),
+                "seat_type": manager.SEAT_CHATGPT,
+                "plan_type_raw": "team",
+                "last_quota": {"primary_pct": 1, "primary_resets_at": 9999999999},
+            }
+        ],
+    )
+    monkeypatch.setattr(manager, "_select_reuse_candidates", lambda accounts, threshold, **kwargs: list(accounts))
+    monkeypatch.setattr(manager, "check_codex_quota", lambda token, **_kwargs: ("auth_error", None))
+    monkeypatch.setattr(
+        manager,
+        "reinvite_account",
+        lambda _chatgpt, _mail, acc: events.append(("reinvite", acc["email"])) or True,
+    )
+    monkeypatch.setattr(
+        manager,
+        "create_new_account",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("should reuse instead of creating new")),
+    )
+
+    out = manager._replace_single(chatgpt, mail, "old@example.com", reason="auto-check")
+
+    assert out["kicked"] is True
+    assert out["filled_by"] == "standby@example.com"
+    assert out["method"] == "reuse"
+    assert ("reinvite", "standby@example.com") in events
+
+
+def test_cmd_rotate_respects_reuse_candidate_limit(monkeypatch, tmp_path):
+    import autoteam.config as config
+
+    chatgpt = _FakeChatGPT()
+    count_values = iter([2, 3])
+    events = []
+
+    first_auth = tmp_path / "first-team.json"
+    second_auth = tmp_path / "second-team.json"
+    first_auth.write_text("{}", encoding="utf-8")
+    second_auth.write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(config, "ROTATE_SKIP_REUSE", False)
+    monkeypatch.setattr(config, "ROTATE_REUSE_CANDIDATE_LIMIT", 1)
+    monkeypatch.setattr(manager, "sync_account_states", lambda: events.append(("sync_account_states", None)))
+    monkeypatch.setattr(manager, "cmd_check", lambda **kwargs: events.append(("cmd_check", None)))
+    monkeypatch.setattr(manager, "ChatGPTTeamAPI", lambda: chatgpt)
+    monkeypatch.setattr(manager, "CloudMailClient", lambda: _FakeMailClient())
+    monkeypatch.setattr(manager, "load_accounts", lambda: [])
+    monkeypatch.setattr(manager, "get_team_member_count", lambda _chatgpt: next(count_values))
+    monkeypatch.setattr(
+        manager,
+        "_find_team_auth_file",
+        lambda email: {
+            "old-1@example.com": str(first_auth),
+            "old-2@example.com": str(second_auth),
+        }.get(email),
+    )
+    monkeypatch.setattr(
+        manager,
+        "get_standby_accounts",
+        lambda: [
+            {
+                "email": "old-1@example.com",
+                "_quota_recovered": True,
+                "seat_type": manager.SEAT_CHATGPT,
+                "last_quota": {"primary_pct": 0, "primary_total": 1000},
+            },
+            {
+                "email": "old-2@example.com",
+                "_quota_recovered": True,
+                "seat_type": manager.SEAT_CHATGPT,
+                "last_quota": {"primary_pct": 0, "primary_total": 1000},
+            },
+        ],
+    )
+    monkeypatch.setattr(
+        manager,
+        "_reuse_one_standby",
+        lambda acc, threshold, **kwargs: events.append(("reuse", acc["email"])) or {
+            "email": acc["email"],
+            "result": "failed",
+            "error": None,
+        },
+    )
+    monkeypatch.setattr(
+        manager,
+        "create_new_account",
+        lambda _chatgpt, _mail: events.append(("create", None)) or True,
+    )
+    monkeypatch.setattr(manager, "sync_to_cpa", lambda: events.append(("sync_to_cpa", None)))
+
+    manager.cmd_rotate(target_seats=3)
+
+    assert events == [
+        ("sync_account_states", None),
+        ("cmd_check", None),
+        ("reuse", "old-1@example.com"),
+        ("create", None),
+        ("sync_to_cpa", None),
+    ]

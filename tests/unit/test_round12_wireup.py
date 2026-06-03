@@ -83,6 +83,8 @@ class TestC1AuthRepairWireUp:
         )
 
         # Mock the heavy parts of reinvite_account
+        monkeypatch.setattr(manager_mod, "invite_to_team", lambda *a, **kw: True)
+        monkeypatch.setattr(manager_mod, "_wait_email_in_team", lambda *a, **kw: True)
         monkeypatch.setattr(manager_mod, "login_codex_via_browser", lambda *a, **kw: None)
         monkeypatch.setattr(manager_mod, "remove_from_team", lambda *a, **kw: "already_absent")
         monkeypatch.setattr(manager_mod, "_is_email_in_team", lambda email: False)
@@ -122,6 +124,8 @@ class TestC1AuthRepairWireUp:
                 "plan_type_raw": "free",
             },
         )
+        monkeypatch.setattr(manager_mod, "invite_to_team", lambda *a, **kw: True)
+        monkeypatch.setattr(manager_mod, "_wait_email_in_team", lambda *a, **kw: True)
         monkeypatch.setattr(manager_mod, "remove_from_team", lambda *a, **kw: "removed")
         monkeypatch.setattr(manager_mod, "_is_email_in_team", lambda email: False)
 
@@ -202,6 +206,8 @@ class TestC1AuthRepairWireUp:
                 "plan_type_raw": "team",
             },
         )
+        monkeypatch.setattr(manager_mod, "invite_to_team", lambda *a, **kw: True)
+        monkeypatch.setattr(manager_mod, "_wait_email_in_team", lambda *a, **kw: True)
         monkeypatch.setattr(
             manager_mod, "check_codex_quota",
             lambda *a, **kw: ("ok", {"primary_pct": 0, "primary_total": 1000}),

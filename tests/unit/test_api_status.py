@@ -31,7 +31,7 @@ def test_get_status_normalizes_main_account_status_from_saved_auth(tmp_path, mon
     monkeypatch.setattr("autoteam.codex_auth.get_saved_main_auth_file", lambda: str(auth_file))
     monkeypatch.setattr(
         "autoteam.codex_auth.check_codex_quota",
-        lambda access_token: (
+        lambda access_token, **_kwargs: (
             "ok",
             {
                 "primary_pct": 8,
@@ -72,6 +72,27 @@ def test_get_status_survives_runtime_resource_probe_failure(monkeypatch):
 
     assert result["accounts"] == []
     assert result["runtime_resources"] == {"error": "runtime_resource_snapshot_failed"}
+
+
+def test_check_account_codex_quota_uses_auth_file_account_id(tmp_path, monkeypatch):
+    auth_file = tmp_path / "codex-child@example.com-team.json"
+    auth_file.write_text(
+        json.dumps({"access_token": "token-child", "account_id": "acct-child"}),
+        encoding="utf-8",
+    )
+    calls = []
+
+    def fake_check(access_token, **kwargs):
+        calls.append((access_token, kwargs.get("account_id")))
+        return "ok", {"primary_pct": 1}
+
+    monkeypatch.setattr("autoteam.codex_auth.check_codex_quota", fake_check)
+
+    status, info = api._check_account_codex_quota({"email": "child@example.com", "auth_file": str(auth_file)})
+
+    assert status == "ok"
+    assert info == {"primary_pct": 1}
+    assert calls == [("token-child", "acct-child")]
 
 
 def test_get_status_includes_ipv6_pool_status(monkeypatch):
@@ -700,7 +721,7 @@ def test_run_task_records_progress_history(monkeypatch):
 def test_get_status_counts_disabled_and_skips_disabled_quota_checks(tmp_path, monkeypatch):
     enabled_auth = tmp_path / "enabled.json"
     disabled_auth = tmp_path / "disabled.json"
-    enabled_auth.write_text(json.dumps({"access_token": "token-enabled"}), encoding="utf-8")
+    enabled_auth.write_text(json.dumps({"access_token": "token-enabled", "account_id": "acct-enabled"}), encoding="utf-8")
     disabled_auth.write_text(json.dumps({"access_token": "token-disabled"}), encoding="utf-8")
 
     monkeypatch.setattr(
@@ -712,10 +733,10 @@ def test_get_status_counts_disabled_and_skips_disabled_quota_checks(tmp_path, mo
     )
     monkeypatch.setattr(api, "_is_main_account_email", lambda _email: False)
 
-    seen_tokens = []
+    seen_calls = []
 
-    def fake_check_quota(access_token):
-        seen_tokens.append(access_token)
+    def fake_check_quota(access_token, **kwargs):
+        seen_calls.append((access_token, kwargs.get("account_id")))
         return (
             "ok",
             {
@@ -730,7 +751,7 @@ def test_get_status_counts_disabled_and_skips_disabled_quota_checks(tmp_path, mo
 
     result = api.get_status()
 
-    assert seen_tokens == ["token-enabled"]
+    assert seen_calls == [("token-enabled", "acct-enabled")]
     assert {item["email"]: item["status"] for item in result["accounts"]} == {
         "enabled@example.com": "active",
         "disabled@example.com": "disabled",

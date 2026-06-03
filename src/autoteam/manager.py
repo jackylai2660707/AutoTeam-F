@@ -22,6 +22,7 @@ import getpass
 import json
 import logging
 import os
+import shutil
 import sys
 import threading
 import time
@@ -29,8 +30,16 @@ from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 
-from autoteam.account_ops import delete_managed_account, delete_team_invite, fetch_team_state, team_invite_email
+from autoteam.account_ops import (
+    delete_managed_account,
+    delete_team_invite,
+    fetch_team_state,
+    team_invite_email,
+    team_member_email,
+)
 from autoteam.accounts import (
+    SEAT_CHATGPT,
+    SEAT_CODEX,
     STATUS_ACTIVE,
     STATUS_AUTH_INVALID,
     STATUS_AUTH_PENDING,
@@ -46,6 +55,7 @@ from autoteam.accounts import (
     is_account_disabled,
     is_supported_plan,
     load_accounts,
+    normalize_plan_type,
     save_accounts,
     update_account,
 )
@@ -75,6 +85,7 @@ from autoteam.playwright_lifecycle import close_playwright_objects
 from autoteam.register_failures import MASTER_SUBSCRIPTION_DEGRADED, record_failure
 from autoteam.signup_profile import SignupProfile, generate_signup_profile
 from autoteam.sync_targets import (
+    delete_account_from_configured_targets,
     sync_account_to_configured_targets,
 )
 from autoteam.sync_targets import (
@@ -206,6 +217,7 @@ def _is_main_account_email(email: str | None) -> bool:
 
 
 _GOOGLE_AUTO_REUSE_DOMAINS = {"gmail.com", "googlemail.com"}
+_TEAM_REUSE_SEAT_TYPES = frozenset({SEAT_CHATGPT, SEAT_CODEX})
 
 
 def _clamp_team_target_seats(value, *, minimum: int = TEAM_SEATS_MIN) -> int:
@@ -236,6 +248,209 @@ def _auto_reuse_skip_reason(acc: dict | None) -> str | None:
     if provider == "google":
         return "Google 登录账号暂不支持自动复用"
     return None
+
+
+def _team_auth_file_for_reuse(acc: dict | None) -> str | None:
+    acc = acc or {}
+    auth_file = _resolve_auth_file_path(acc.get("auth_file"))
+    if auth_file.exists() and "-team-" in auth_file.name:
+        return str(auth_file)
+    email = _normalized_email(acc.get("email"))
+    if not email:
+        return None
+    found = _find_team_auth_file(email)
+    if not found:
+        return None
+    resolved = _resolve_auth_file_path(found)
+    if resolved.exists():
+        return str(resolved)
+    return None
+
+
+def _can_fresh_oauth_reuse(acc: dict | None) -> bool:
+    """Whether a standby account can be re-invited and OAuth'd without old Team token."""
+    acc = acc or {}
+    if not (acc.get("password") or "").strip():
+        return False
+    if not _has_account_mail_binding(acc):
+        return False
+    return True
+
+
+def _reuse_candidate_has_team_history(acc: dict | None) -> bool:
+    acc = acc or {}
+    seat_type = str(acc.get("seat_type") or "").strip().lower()
+    plan_type_raw = normalize_plan_type(acc.get("plan_type_raw"))
+    return seat_type in _TEAM_REUSE_SEAT_TYPES or plan_type_raw == "team"
+
+
+def _reuse_candidate_has_healthy_snapshot(acc: dict | None, threshold: int, *, now: float | None = None) -> bool:
+    quota_info = (acc or {}).get("last_quota")
+    if not isinstance(quota_info, dict) or not quota_info:
+        return False
+    if _pending_historical_exhausted_info(quota_info, now=now):
+        return False
+    try:
+        primary_pct = int(quota_info.get("primary_pct", 0) or 0)
+    except Exception:
+        return False
+    try:
+        primary_total = quota_info.get("primary_total")
+        if primary_total is not None and int(primary_total or 0) <= 0:
+            return False
+    except Exception:
+        pass
+    return max(0, 100 - primary_pct) >= int(threshold)
+
+
+def _prepare_reuse_candidate(acc: dict | None, threshold: int, *, now: float | None = None) -> tuple[dict | None, tuple | None]:
+    acc = acc or {}
+    current_ts = time.time() if now is None else now
+    if not acc:
+        return None, None
+    if acc.get("reuse_disabled"):
+        return None, None
+    if _auto_reuse_skip_reason(acc):
+        return None, None
+    if _auth_repair_skip_reason(acc, now=current_ts):
+        return None, None
+    if acc.get("auth_last_error"):
+        return None, None
+
+    team_auth_file = _team_auth_file_for_reuse(acc)
+    fresh_oauth_reuse = _can_fresh_oauth_reuse(acc)
+    if not (team_auth_file or fresh_oauth_reuse):
+        return None, None
+
+    quota_signal = _reuse_candidate_has_healthy_snapshot(acc, threshold, now=current_ts)
+    if not (acc.get("_quota_recovered") or quota_signal):
+        return None, None
+
+    team_history = _reuse_candidate_has_team_history(acc)
+    if not (team_history or quota_signal or fresh_oauth_reuse):
+        return None, None
+
+    prepared = dict(acc)
+    if team_auth_file:
+        prepared["auth_file"] = team_auth_file
+
+    recent_quota_ts = 0
+    try:
+        recent_quota_ts = int(prepared.get("last_quota_check_at") or 0)
+    except Exception:
+        recent_quota_ts = 0
+
+    last_active_ts = 0
+    try:
+        last_active_ts = int(prepared.get("last_active_at") or 0)
+    except Exception:
+        last_active_ts = 0
+
+    priority = (
+        0 if quota_signal else 1,
+        0 if team_history else 1,
+        0 if str(prepared.get("seat_type") or "").strip().lower() == SEAT_CHATGPT else 1,
+        -recent_quota_ts,
+        -last_active_ts,
+        _normalized_email(prepared.get("email")),
+    )
+    return prepared, priority
+
+
+def _select_reuse_candidates(
+    standby_list: list[dict] | None,
+    threshold: int,
+    *,
+    exclude_emails: set[str] | None = None,
+    stage_label: str = "[轮转]",
+) -> list[dict]:
+    try:
+        from autoteam.config import ROTATE_REUSE_CANDIDATE_LIMIT
+    except Exception:
+        ROTATE_REUSE_CANDIDATE_LIMIT = 2
+
+    excluded = {_normalized_email(item) for item in (exclude_emails or set()) if _normalized_email(item)}
+    ranked: list[tuple[tuple, dict]] = []
+    for raw in standby_list or []:
+        email = _normalized_email((raw or {}).get("email"))
+        if not email or email in excluded:
+            continue
+        prepared, priority = _prepare_reuse_candidate(raw, threshold)
+        if prepared is None or priority is None:
+            continue
+        ranked.append((priority, prepared))
+
+    ranked.sort(key=lambda item: item[0])
+    selected = [acc for _priority, acc in ranked[:ROTATE_REUSE_CANDIDATE_LIMIT]]
+    if ranked and len(selected) < len(ranked):
+        logger.info(
+            "%s 复用候选裁剪: 高置信旧号 %d 个，仅尝试前 %d 个",
+            stage_label,
+            len(ranked),
+            len(selected),
+        )
+    elif standby_list and not selected:
+        logger.info("%s 当前没有高置信旧号，直接走新号补位", stage_label)
+    return selected
+
+
+def _allow_reuse_on_auth_error(
+    acc: dict | None,
+    threshold: int,
+    *,
+    now: float | None = None,
+    stage_label: str = "[轮转]",
+) -> bool:
+    """Allow standby reuse to continue when only the old Team token has expired.
+
+    被踢出 Team 的 standby 账号，其旧 team auth_file 常常会自然 401/403。
+    这不等于账号不能复用，只说明旧 token 不能再拿来查当前 Team workspace。
+    若历史额度快照显示 5h 已重置或仍高于阈值，则允许继续走 fresh OAuth reinvite；
+    最终由 reinvite_account 内的新 token 实测验收做裁决。
+    """
+    acc = acc or {}
+    email = acc.get("email") or "<unknown>"
+    current_ts = time.time() if now is None else now
+    quota_info = acc.get("last_quota")
+    if isinstance(quota_info, dict) and quota_info:
+        exhausted_info = _pending_historical_exhausted_info(quota_info, now=current_ts)
+        if exhausted_info:
+            window_label = _quota_window_label(exhausted_info.get("window"))
+            logger.info("%s 跳过 %s（%s额度未恢复）", stage_label, email, window_label)
+            return False
+
+        try:
+            p_remain = max(0, 100 - int(quota_info.get("primary_pct", 0) or 0))
+        except Exception:
+            p_remain = 0
+        try:
+            p_resets = int(quota_info.get("primary_resets_at", 0) or 0)
+        except Exception:
+            p_resets = 0
+
+        if p_resets and current_ts >= p_resets:
+            logger.info("%s %s 的旧 Team token 已失效，但 5h 重置时间已过，允许 fresh OAuth 复用", stage_label, email)
+            return True
+        if p_remain >= int(threshold):
+            logger.info(
+                "%s %s 的旧 Team token 已失效，但历史 5h 剩余 %d%% >= %d%%，允许 fresh OAuth 复用",
+                stage_label,
+                email,
+                p_remain,
+                threshold,
+            )
+            return True
+
+        logger.info("%s 跳过 %s（上次额度 %d%% < %d%%）", stage_label, email, p_remain, threshold)
+        return False
+
+    resets_at = acc.get("quota_resets_at")
+    if resets_at and current_ts < resets_at:
+        mins = max(0, int((resets_at - current_ts) / 60))
+        logger.info("%s 跳过 %s（%d 分钟后恢复）", stage_label, email, mins)
+        return False
+
+    return False
 
 
 # --------------------------------------------------------------------------
@@ -465,6 +680,16 @@ def _ensure_account_ipv6_proxy(email: str | None) -> tuple[str, str]:
     email = _normalized_email(email)
     if not email:
         return "", ""
+    try:
+        from autoteam.runtime_config import get_next_playwright_proxy_url
+
+        proxy_url = get_next_playwright_proxy_url()
+        if proxy_url:
+            logger.info("[ProxyPool] account %s using static proxy %s", email, proxy_url)
+            return proxy_url, proxy_url
+    except Exception as exc:
+        logger.warning("[ProxyPool] static proxy pool unavailable for %s, falling back to IPv6/direct: %s", email, exc)
+
     required = False
     try:
         from autoteam import config as runtime_config
@@ -517,6 +742,93 @@ def _discard_auth_repair_failed_account_record(
         retired_reason=reason,
     )
     _release_account_ipv6_proxy(email)
+
+
+def _abandon_account_after_add_phone(email: str, *, detail: str | None = None) -> None:
+    """Permanently remove an add-phone-hit account from automation candidates."""
+    update_account(
+        email,
+        status=STATUS_AUTH_INVALID,
+        disabled=True,
+        reuse_disabled=True,
+        retired_at=time.time(),
+        retired_reason="add_phone_abandoned",
+        auth_last_error="add_phone",
+        auth_last_error_detail=detail or "add-phone 手机验证",
+        auth_last_failed_at=time.time(),
+        auth_retry_after=None,
+        auth_retry_paused=True,
+    )
+    _release_account_ipv6_proxy(email)
+
+
+def _retire_team_auth_after_team_exit(email: str, *, reason: str = "team_exit") -> list[str]:
+    """Retire stale Team auth after an account leaves Team.
+
+    A Team OAuth token becomes invalid once the child leaves the workspace. Keep a
+    small local backup for forensics, but remove the live auth_file reference and
+    delete matching remote credentials so CPA/Sub2API do not accumulate dead auths.
+    """
+    email = _normalized_email(email)
+    if not email or _is_main_account_email(email):
+        return []
+
+    acc = find_account(load_accounts(), email)
+    if not acc:
+        return []
+
+    candidates: dict[str, Path] = {}
+    auth_file = acc.get("auth_file")
+    if auth_file:
+        path = _resolve_auth_file_path(auth_file)
+        if path.exists() and "-team-" in path.name:
+            candidates[path.name] = path
+    found = _find_team_auth_file(email)
+    if found:
+        path = _resolve_auth_file_path(found)
+        if path.exists() and "-team-" in path.name:
+            candidates[path.name] = path
+
+    if not candidates:
+        if acc.get("auth_file"):
+            update_account(email, auth_file=None, stale_team_auth_retired_at=time.time(), _reason=reason)
+        return []
+
+    retired_names: list[str] = []
+    backup_paths: list[str] = []
+    for path in candidates.values():
+        try:
+            backup_dir = path.parent.parent / "auths_retired" / time.strftime("%Y%m%d", time.gmtime())
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            backup_path = backup_dir / f"{int(time.time())}-{path.name}"
+            shutil.move(str(path), str(backup_path))
+            retired_names.append(path.name)
+            backup_paths.append(str(backup_path))
+            logger.info("[Auth] 已退役离队 Team auth: %s -> %s", path.name, backup_path)
+        except Exception as exc:
+            logger.warning("[Auth] 退役离队 Team auth 失败: %s (%s)", path, exc)
+
+    update_account(
+        email,
+        auth_file=None,
+        stale_team_auth_retired_at=time.time(),
+        stale_team_auth_retired_reason=reason,
+        stale_team_auth_backup=backup_paths[-1] if backup_paths else None,
+        _reason=reason,
+    )
+
+    if retired_names:
+        try:
+            delete_account_from_configured_targets(email, auth_names=retired_names, include_disabled=True)
+        except Exception as exc:
+            logger.warning("[Auth] 删除远端 stale Team auth 失败，等待下轮同步清理: %s", exc)
+    return retired_names
+
+
+def _mark_standby_after_team_exit(email: str, *, reason: str) -> None:
+    """Mark an account standby and retire its stale Team auth in one place."""
+    update_account(email, status=STATUS_STANDBY, _reason=reason)
+    _retire_team_auth_after_team_exit(email, reason=reason)
 
 
 def _attach_account_proxy_to_bundle(email: str | None, bundle: dict | None, proxy_url: str | None = None) -> None:
@@ -765,6 +1077,7 @@ def _auth_repair_error_label(error_type: str | None) -> str:
         "email_verification": "邮箱验证码页卡住",
         "workspace_selection": "workspace 选择未完成",
         "account_selection": "账号选择页未完成",
+        "no_valid_organizations": "组织列表尚未同步",
         "login_state_lost": "登录态丢失",
         "missing_auth_file": "缺少本地 Codex 凭证",
         "auth_error_discard": "认证失效后一次性丢弃",
@@ -993,7 +1306,10 @@ def _record_auth_repair_failure(
     # 上游用 STATUS_AUTH_PENDING; 本地 STATUS_AUTH_INVALID 同 literal "auth_invalid",
     # 走 default_machine.transition 时映射到 AccountState.AUTH_PENDING.
     final_status = STATUS_STANDBY if seat_released or not is_team_member else STATUS_AUTH_INVALID
-    update_account(email, status=final_status, _reason=f"auth_repair:{error_type}")
+    if final_status == STATUS_STANDBY:
+        _mark_standby_after_team_exit(email, reason=f"auth_repair:{error_type}")
+    else:
+        update_account(email, status=final_status, _reason=f"auth_repair:{error_type}")
     if discard_failed_repair and seat_released and not protected_local_credential:
         _discard_auth_repair_failed_account_record(
             email,
@@ -1514,7 +1830,7 @@ def _reconcile_team_members(chatgpt_api=None, *, dry_run=False):
                         if remove_status in ("removed", "already_absent"):
                             acc = acc_map.get(email)
                             if acc and acc.get("status") == STATUS_ACTIVE:
-                                update_account(acc.get("email"), status=STATUS_STANDBY)
+                                _mark_standby_after_team_exit(acc.get("email"), reason="reconcile_over_cap")
                             result["over_cap_kicked"].append(email)
                             logger.info("[对账] 超员 kick %s (priority=%s)", email, _priority(email))
                         else:
@@ -1562,7 +1878,7 @@ def _probe_kicked_account(acc):
         access_token = data.get("access_token") or (data.get("tokens") or {}).get("access_token")
         if not access_token:
             return None
-        status, _ = check_codex_quota(access_token)
+        status, _ = check_codex_quota(access_token, account_id=data.get("account_id") or None)
         return status
     except Exception as exc:
         logger.debug("[同步] _probe_kicked_account(%s) 异常: %s", acc.get("email"), exc)
@@ -1953,7 +2269,7 @@ def cmd_status():
             auth_data = json.loads(read_text(Path(acc["auth_file"])))
             access_token = auth_data.get("access_token")
             if access_token:
-                status, info = check_codex_quota(access_token)
+                status, info = check_codex_quota(access_token, account_id=auth_data.get("account_id") or None)
                 if status == "ok" and isinstance(info, dict):
                     quota_cache[acc["email"]] = info
                 elif status == "exhausted":
@@ -2963,6 +3279,13 @@ def _can_cancel_pending_invite(email: str, acc: dict | None) -> tuple[bool, str]
     if _is_main_account_email(email):
         return False, "main_account"
     if acc and _has_auth_file(acc):
+        if acc.get("status") in (STATUS_STANDBY, STATUS_AUTH_INVALID):
+            try:
+                auth_status, _auth_info = _check_and_refresh(acc)
+            except Exception:
+                auth_status = None
+            if auth_status in ("auth_error", "no_auth"):
+                return True, "stale_auth_protected_pending"
         return False, "local_auth_protected"
     if _find_team_auth_file(email) is not None:
         return False, "auth_file_protected"
@@ -3101,7 +3424,7 @@ def _validate_managed_account_operational(
         if not access_token:
             logger.warning("%s %s auth_file 缺少 access_token", stage_label, email)
             return False
-        status_str, info = check_codex_quota(access_token)
+        status_str, info = check_codex_quota(access_token, account_id=auth_data.get("account_id") or None)
     except Exception as exc:
         logger.warning("%s %s quota 验证异常: %s", stage_label, email, exc)
         return False
@@ -3485,42 +3808,100 @@ def _run_post_register_oauth(
         return None
 
     # 原有 Team 流程 — SPEC-2 §3.1.2 改造:catch RegisterBlocked + plan_supported 检查 + quota probe
-    try:
-        bundle = _login_codex_via_browser_with_proxy(
-            email,
-            password,
-            mail_client=mail_client,
-            signup_profile=signup_profile,
-            playwright_proxy_url=playwright_proxy_url,
-        )
-    except RegisterBlocked as blocked:
-        if blocked.is_phone:
-            logger.error(
-                "[注册] %s Team OAuth 触发 add-phone (step=%s),账号已入 Team 席位标 AUTH_INVALID 待 reconcile",
-                email, blocked.step,
-            )
-            record_failure(
-                email, "oauth_phone_blocked",
-                f"Team OAuth 阶段触发 add-phone (step={blocked.step})",
-                step=blocked.step,
-                stage="run_post_register_oauth_team",
-            )
-            # Team 模式下账号已成功 invite,不能 delete_account(席位仍占着);标 AUTH_INVALID 让 reconcile 接管
-            update_account(
+    team_oauth_retries = 5
+    team_oauth_backoff = (0, 6, 12, 20, 30)
+    bundle = None
+    team_login_result = None
+    for oauth_attempt in range(team_oauth_retries):
+        delay = team_oauth_backoff[oauth_attempt] if oauth_attempt < len(team_oauth_backoff) else team_oauth_backoff[-1]
+        if oauth_attempt > 0 and isinstance(team_login_result, dict):
+            delay = max(delay, _oauth_retry_delay_seconds(team_login_result.get("error_type")))
+        if delay > 0:
+            logger.info(
+                "[注册] %s Team OAuth 第 %d/%d 次重试,先退避 %ds",
                 email,
-                status=STATUS_AUTH_INVALID,
-                workspace_account_id=get_chatgpt_account_id() or None,
+                oauth_attempt + 1,
+                team_oauth_retries,
+                delay,
             )
-            _kick_team_seat_after_oauth_failure(email, reason="register_blocked_phone")
-            _record_outcome("oauth_phone_blocked", reason="OAuth 阶段触发 add-phone")
+            time.sleep(delay)
+        try:
+            login_result = _login_codex_via_browser_with_proxy(
+                email,
+                password,
+                mail_client=mail_client,
+                return_result=True,
+                signup_profile=signup_profile,
+                playwright_proxy_url=playwright_proxy_url,
+            )
+        except RegisterBlocked as blocked:
+            if blocked.is_phone:
+                logger.error(
+                    "[注册] %s Team OAuth 触发 add-phone (step=%s),账号已入 Team 席位标 AUTH_INVALID 待 reconcile",
+                    email, blocked.step,
+                )
+                record_failure(
+                    email, "oauth_phone_blocked",
+                    f"Team OAuth 阶段触发 add-phone (step={blocked.step})",
+                    step=blocked.step,
+                    stage="run_post_register_oauth_team",
+                )
+                # Team 模式下账号已成功 invite,不能 delete_account(席位仍占着);标 AUTH_INVALID 让 reconcile 接管
+                _abandon_account_after_add_phone(
+                    email,
+                    detail=f"Team OAuth 阶段触发 add-phone (step={blocked.step})",
+                )
+                update_account(email, workspace_account_id=get_chatgpt_account_id() or None)
+                _kick_team_seat_after_oauth_failure(email, reason="register_blocked_phone")
+                _record_outcome("oauth_phone_blocked", reason="OAuth 阶段触发 add-phone")
+                return None
+            record_failure(email, "exception", f"Team OAuth RegisterBlocked: {blocked.reason}",
+                           stage="run_post_register_oauth_team")
+            update_account(email, status=STATUS_AUTH_INVALID,
+                           workspace_account_id=get_chatgpt_account_id() or None)
+            _kick_team_seat_after_oauth_failure(email, reason="register_blocked_unexpected")
+            _record_outcome("oauth_failed", reason=f"unexpected RegisterBlocked: {blocked.reason}")
             return None
-        record_failure(email, "exception", f"Team OAuth RegisterBlocked: {blocked.reason}",
-                       stage="run_post_register_oauth_team")
-        update_account(email, status=STATUS_AUTH_INVALID,
-                       workspace_account_id=get_chatgpt_account_id() or None)
-        _kick_team_seat_after_oauth_failure(email, reason="register_blocked_unexpected")
-        _record_outcome("oauth_failed", reason=f"unexpected RegisterBlocked: {blocked.reason}")
-        return None
+        if isinstance(login_result, dict) and "ok" in login_result:
+            team_login_result = login_result
+            bundle = login_result.get("bundle") if login_result.get("ok") else None
+            if bundle:
+                bundle_plan = (bundle.get("plan_type") or "").lower()
+                if bundle_plan == "team":
+                    break
+                team_login_result = {
+                    "ok": False,
+                    "bundle": None,
+                    "error_type": "non_team_plan",
+                    "error_detail": f"Team OAuth 登录后 plan={bundle_plan or 'unknown'}，未进入 Team workspace",
+                    "retryable": True,
+                }
+                bundle = None
+            else:
+                bundle = None
+        else:
+            bundle = login_result
+            team_login_result = {
+                "ok": bool(bundle),
+                "bundle": bundle if bundle else None,
+                "error_type": None if bundle else "login_failed",
+                "error_detail": None if bundle else "登录失败",
+                "retryable": False if bundle else True,
+            }
+            if bundle:
+                break
+        if bundle:
+            break
+        logger.warning(
+            "[注册] %s Team OAuth 第 %d/%d 次未返回 bundle(%s: %s)",
+            email,
+            oauth_attempt + 1,
+            team_oauth_retries,
+            _auth_repair_error_label(team_login_result.get("error_type") if isinstance(team_login_result, dict) else None),
+            (team_login_result.get("error_detail") if isinstance(team_login_result, dict) else "") or "登录失败",
+        )
+        if isinstance(team_login_result, dict) and not team_login_result.get("retryable", True):
+            break
 
     if bundle:
         # SPEC-2 shared/plan-type-whitelist §5 — plan_supported=False:account 已入 Team 但无法用,
@@ -3619,7 +4000,7 @@ def _run_post_register_oauth(
             return email
         else:
             logger.warning("[注册] %s 入池但状态=%s,需要后续处理", email, update_fields["status"])
-            _record_outcome("quota_issue", plan=bundle_plan, status=update_fields["status"])
+            _record_outcome("quota_issue", plan=bundle_plan, account_status=update_fields["status"])
             return None
 
     # Round 11 — OAuth bundle 缺失分支,与同函数其他失败路径保持 status 一致(都是 AUTH_INVALID)。
@@ -3887,6 +4268,26 @@ def _is_email_in_team(email):
             chatgpt.stop()
 
 
+def _wait_email_in_team(email: str, *, retries: int = 6, interval_s: float = 3.0) -> bool:
+    """等待 OpenAI 成员列表最终一致性，确认邮箱是否已入 Team。"""
+    email_l = (email or "").strip().lower()
+    if not email_l:
+        return False
+    for idx in range(max(1, int(retries))):
+        if _is_email_in_team(email_l):
+            return True
+        if idx + 1 < retries:
+            logger.info(
+                "[直接注册] 远端成员确认未命中: %s，等待 %.1fs 后重试 (%d/%d)",
+                email_l,
+                interval_s,
+                idx + 1,
+                retries,
+            )
+            time.sleep(max(0.1, float(interval_s)))
+    return False
+
+
 def _wait_for_invite_link(mail_client, email: str, *, mail_account_id=None, timeout: int | None = None) -> str | None:
     timeout = MAIL_TIMEOUT if timeout is None else max(1, int(timeout))
     deadline = time.time() + timeout
@@ -3924,8 +4325,19 @@ def _cleanup_failed_created_account(
         return
 
     logger.warning("[创建] 丢弃失败新账号: %s（%s）", email, reason)
+    current_acc = find_account(load_accounts(), email)
+    add_phone_abandoned = bool(
+        current_acc
+        and (
+            current_acc.get("auth_last_error") == "add_phone"
+            or current_acc.get("retired_reason") == "add_phone_abandoned"
+        )
+    )
+    discard_reason = "add_phone_abandoned" if add_phone_abandoned else reason
     try:
-        _discard_auth_repair_failed_account_record(email, reason, status=STATUS_STANDBY)
+        # Keep the terminal add-phone reason intact. The record may be deleted
+        # below; if deletion fails, it must remain non-reusable and diagnosable.
+        _discard_auth_repair_failed_account_record(email, discard_reason, status=STATUS_STANDBY)
     except Exception:
         pass
 
@@ -3943,6 +4355,34 @@ def _cleanup_failed_created_account(
         return
     except Exception as exc:
         logger.warning("[创建] delete_managed_account 清理失败: %s", exc)
+        if chatgpt_api is not None:
+            try:
+                members, invites = fetch_team_state(chatgpt_api)
+                remote_member = any(team_member_email(member) == email for member in members)
+                remote_invite = any(team_invite_email(invite) == email for invite in invites)
+                if not remote_member and not remote_invite:
+                    logger.info("[创建] 远端已无残留，继续清理本地记录: %s", email)
+                    delete_managed_account(
+                        email,
+                        remove_remote=False,
+                        remove_cloudmail=True,
+                        sync_cpa_after=False,
+                        chatgpt_api=chatgpt_api,
+                        mail_client=mail_client,
+                    )
+                    return
+            except Exception as verify_exc:
+                logger.warning("[创建] 远端残留复查失败: %s", verify_exc)
+
+    if add_phone_abandoned:
+        try:
+            _discard_auth_repair_failed_account_record(
+                email,
+                "add_phone_abandoned",
+                status=STATUS_AUTH_INVALID,
+            )
+        except Exception:
+            pass
 
     if mail_account_id is not None:
         try:
@@ -4906,9 +5346,13 @@ def _register_direct_once(
             _safe_invite_screenshot(page, "direct_07_final.png")
 
             current_url = page.url
-            success = "chatgpt.com" in current_url and "auth" not in current_url and not _is_google_redirect(page)
+            page_success = "chatgpt.com" in current_url and "auth" not in current_url and not _is_google_redirect(page)
+            team_confirmed = _wait_email_in_team(email, retries=6, interval_s=3.0) if page_success else False
+            success = bool(page_success and team_confirmed)
             if success:
-                logger.info("[直接注册] 注册成功并已加入 workspace!")
+                logger.info("[直接注册] 注册成功并已加入 workspace(远端确认)!")
+            elif page_success:
+                logger.warning("[直接注册] 页面看似注册完成，但远端成员列表未确认入 Team: %s", email)
             else:
                 logger.warning("[直接注册] 注册可能未完成，URL: %s", current_url)
 
@@ -5593,6 +6037,9 @@ def create_new_account(
         if direct_attempted:
             logger.warning("[创建] path=invite_fallback 失败，direct 注册已经尝试过，停止本轮新号创建")
             return None
+        if mode == "invite_first":
+            logger.warning("[创建] invite_first 模式下邀请链路失败，停止本轮新号创建，不走 direct_fallback")
+            return None
         logger.warning("[创建] 远端邀请注册模式失败，尝试直接注册兜底（仍要求远端成员确认）...")
         if not _prepare_remote_capacity_for_new_seat(chatgpt_api, stage_label="[创建兜底]"):
             logger.warning("[创建] 远端席位已满或有 pending invite 占位，跳过直接注册兜底")
@@ -5633,6 +6080,7 @@ def reinvite_account(chatgpt_api, mail_client, acc):
 
     def _cleanup_team_leftover(reason):
         """OAuth 失败/plan 不对时,兜底 kick 账号,避免假 standby。"""
+        kick_status = None
         try:
             if not _chatgpt_session_ready(chatgpt_api):
                 chatgpt_api.start()
@@ -5645,6 +6093,31 @@ def reinvite_account(chatgpt_api, mail_client, acc):
                 logger.warning("[轮转] OAuth 失败(%s)后 kick %s 返回 status=%s", reason, email, kick_status)
         except Exception as exc:
             logger.warning("[轮转] OAuth 失败后 kick %s 抛异常(留给下次对账兜底): %s", email, exc)
+        if kick_status in ("removed", "already_absent"):
+            _retire_team_auth_after_team_exit(email, reason=f"reinvite_oauth_failed:{reason}")
+        return kick_status
+
+    # 旧账号复用必须先确认远端真的把它放回 Team。否则后续 OAuth/wham 可能出现
+    # “本地看似成功、远端成员列表其实没人”的假恢复。
+    try:
+        if not _is_email_in_team(email):
+            if not _chatgpt_session_ready(chatgpt_api):
+                chatgpt_api.start()
+            if not invite_to_team(chatgpt_api, email, seat_type="default"):
+                logger.warning("[轮转] 旧账号重新邀请失败，保持 standby: %s", email)
+                update_account(email, status=STATUS_STANDBY)
+                return False
+            if not _wait_email_in_team(email, retries=4, interval_s=2.0):
+                logger.warning("[轮转] %s 重新邀请后远端未确认 Team 成员，跳过 OAuth 复用", email)
+                update_account(email, status=STATUS_STANDBY)
+                return False
+    except Exception as exc:
+        logger.warning("[轮转] %s 重新邀请阶段异常，保持 standby: %s", email, exc)
+        update_account(email, status=STATUS_STANDBY)
+        return False
+    finally:
+        if chatgpt_api and _chatgpt_session_ready(chatgpt_api):
+            chatgpt_api.stop()
 
     try:
         auth_proxy_url, playwright_proxy_url = _ensure_account_ipv6_proxy(email)
@@ -5674,6 +6147,10 @@ def reinvite_account(chatgpt_api, mail_client, acc):
                 "[轮转] %s _record_auth_repair_failure 抛异常(忽略): %s",
                 email, repair_exc,
             )
+        try:
+            _abandon_account_after_add_phone(email, detail=str(exc))
+        except Exception as abandon_exc:
+            logger.warning("[轮转] %s add-phone 放弃标记失败(忽略): %s", email, abandon_exc)
         try:
             from autoteam.register_failures import record_failure
             record_failure(email, "oauth_phone_blocked", stage="reinvite_account", detail=str(exc))
@@ -5778,7 +6255,7 @@ def reinvite_account(chatgpt_api, mail_client, acc):
                 threshold = _auto_check_config.get("threshold", AUTO_CHECK_THRESHOLD)
             except Exception:
                 threshold = 10
-            status_str, info = check_codex_quota(access_token)
+            status_str, info = check_codex_quota(access_token, account_id=bundle.get("account_id") or None)
             if status_str == "ok" and isinstance(info, dict):
                 # 不论真假恢复,都写一份最新 last_quota:UI 上看到的额度必须是最新事实,
                 # 否则用户/下游看到的还是上次成功时的旧值(比如 0% 剩 100%)误判可用,
@@ -5831,7 +6308,7 @@ def reinvite_account(chatgpt_api, mail_client, acc):
             update_account(
                 email,
                 status=STATUS_STANDBY,
-                auth_file=auth_file,
+                auth_file=None,
                 quota_exhausted_at=now_ts,
                 quota_resets_at=now_ts + 18000,
             )
@@ -5859,10 +6336,22 @@ def reinvite_account(chatgpt_api, mail_client, acc):
             update_account(
                 email,
                 status=STATUS_STANDBY,
-                auth_file=auth_file,
+                auth_file=None,
                 quota_exhausted_at=None,
                 quota_resets_at=None,
             )
+        return False
+
+    if not _wait_email_in_team(email, retries=3, interval_s=2.0):
+        logger.warning("[轮转] %s OAuth/配额验证通过，但远端未确认 Team 成员，判定假恢复", email)
+        _cleanup_team_leftover("member_not_confirmed")
+        update_account(
+            email,
+            status=STATUS_STANDBY,
+            auth_file=None,
+            quota_exhausted_at=None,
+            quota_resets_at=None,
+        )
         return False
 
     update_account(
@@ -5914,15 +6403,27 @@ def _replace_single(chatgpt, mail_client, email, reason=""):
         logger.error("[替换] kick %s 失败 status=%s,不补位", email, kick_status)
         return outcome
     outcome["kicked"] = True
-    update_account(email, status=STATUS_STANDBY)
+    _mark_standby_after_team_exit(email, reason=reason or "replace_single")
 
-    # 2. 确认当前 Team 非主号子号数,判断是否还有空位
+    # 2. DELETE 成功后 Team /users 可能短时间还返回旧成员数，先等远端席位真正释放，
+    # 再决定是否补位，避免误判“2/2 已满”留下空席。
+    total_capacity = TEAM_SUB_ACCOUNT_HARD_CAP + 1
     try:
-        current_total = get_team_member_count(chatgpt)
+        current_total, _released = _wait_for_remote_capacity_after_removal(
+            chatgpt,
+            target=total_capacity,
+            removed_email=email,
+            timeout=24,
+            stage_label="[替换]",
+        )
     except Exception as exc:
-        logger.warning("[替换] 获取 Team 成员数抛异常: %s,跳过补位", exc)
-        outcome["error"] = f"count_exception: {exc}"
-        return outcome
+        logger.warning("[替换] 等待远端席位释放抛异常: %s,回退到即时成员数查询", exc)
+        try:
+            current_total = get_team_member_count(chatgpt)
+        except Exception as count_exc:
+            logger.warning("[替换] 获取 Team 成员数抛异常: %s,跳过补位", count_exc)
+            outcome["error"] = f"count_exception: {count_exc}"
+            return outcome
     if current_total < 0:
         outcome["error"] = "count_failed"
         return outcome
@@ -5933,36 +6434,32 @@ def _replace_single(chatgpt, mail_client, email, reason=""):
 
     # 3. 优先从 standby 复用,排除刚 kick 的同一 email 防止自环
     email_lc = (email or "").lower()
-    standby_list = [
-        a
-        for a in get_standby_accounts()
-        if a.get("_quota_recovered")
-        and not _is_main_account_email(a.get("email"))
-        and (a.get("email") or "").lower() != email_lc
-    ]
-    for acc in standby_list:
-        skip_reason = _auto_reuse_skip_reason(acc)
-        if skip_reason:
-            logger.info("[替换] 跳过 %s(%s)", acc.get("email"), skip_reason)
-            continue
-        cand_email = acc.get("email")
+    try:
+        from autoteam.config import AUTO_CHECK_THRESHOLD
 
-        # 额度二次验证:不能只信 get_standby_accounts() 的 _quota_recovered(它只看
-        # quota_resets_at 这种粗估时间)。之前有 bug 就是把还在 exhausted 窗口的
-        # standby 反复 reinvite 进 Team,账号一进来就 0% 立马被 kick,把同一批号
-        # 来回洗,席位始终干空。这里直接拿 auth_file 的 access_token 打一次 wham,
-        # 只有 API 确认 "ok 且剩余 >= threshold" 才允许复用。
         try:
-            from autoteam.config import AUTO_CHECK_THRESHOLD
+            from autoteam.api import _auto_check_config
 
-            try:
-                from autoteam.api import _auto_check_config
+            threshold = _auto_check_config.get("threshold", AUTO_CHECK_THRESHOLD)
+        except ImportError:
+            threshold = AUTO_CHECK_THRESHOLD
+    except Exception:
+        threshold = 10
 
-                threshold = _auto_check_config.get("threshold", AUTO_CHECK_THRESHOLD)
-            except ImportError:
-                threshold = AUTO_CHECK_THRESHOLD
-        except Exception:
-            threshold = 10
+    standby_list = _select_reuse_candidates(
+        [
+            a
+            for a in get_standby_accounts()
+            if a.get("_quota_recovered")
+            and not _is_main_account_email(a.get("email"))
+            and (a.get("email") or "").lower() != email_lc
+        ],
+        threshold,
+        exclude_emails={email_lc},
+        stage_label="[替换]",
+    )
+    for acc in standby_list:
+        cand_email = acc.get("email")
 
         auth_file = acc.get("auth_file")
         quota_ok = False
@@ -5971,7 +6468,7 @@ def _replace_single(chatgpt, mail_client, email, reason=""):
                 auth_data = json.loads(read_text(Path(auth_file)))
                 access_token = auth_data.get("access_token")
                 if access_token:
-                    status_str, info = check_codex_quota(access_token)
+                    status_str, info = check_codex_quota(access_token, account_id=auth_data.get("account_id") or None)
                     if status_str == "ok" and isinstance(info, dict):
                         # 实测结果统一刷新 last_quota,避免 UI/下游看到陈旧数据
                         update_account(cand_email, last_quota=info)
@@ -5987,10 +6484,13 @@ def _replace_single(chatgpt, mail_client, email, reason=""):
                             update_account(cand_email, last_quota=quota_info)
                         logger.info("[替换] 跳过 %s(实测 exhausted)", cand_email)
                         continue
-                    # auth_error:token 失效,不是"额度真恢复"的证据,跳过
+                    # auth_error: standby 旧 Team token 可能因离队自然失效。
+                    # 若历史额度快照仍健康，允许继续 fresh OAuth reinvite。
                     elif status_str == "auth_error":
-                        logger.info("[替换] 跳过 %s(token auth_error,无法验证额度)", cand_email)
-                        continue
+                        if _allow_reuse_on_auth_error(acc, threshold, stage_label="[替换]"):
+                            quota_ok = True
+                        else:
+                            continue
                     # network_error:临时网络故障,不能当"额度恢复"凭证,本轮不复用,
                     # 等下一轮再试(不动 acc 状态)
                     elif status_str == "network_error":
@@ -6000,9 +6500,12 @@ def _replace_single(chatgpt, mail_client, email, reason=""):
                 logger.info("[替换] %s 额度验证抛异常(跳过): %s", cand_email, exc)
                 continue
         if not quota_ok:
-            # 没 auth_file 或验证没通过都跳过,宁可去创建新号也别把 0% 账号塞回 Team
-            logger.info("[替换] 跳过 %s(无 auth_file 或额度未通过验证)", cand_email)
-            continue
+            if _allow_reuse_on_auth_error(acc, threshold, stage_label="[替换]"):
+                quota_ok = True
+            else:
+                # 没 auth_file 且历史额度也不健康时跳过,宁可去创建新号也别把 0% 账号塞回 Team
+                logger.info("[替换] 跳过 %s(无 auth_file 或额度未通过验证)", cand_email)
+                continue
 
         logger.info("[替换] 尝试复用 standby: %s", cand_email)
         if not _chatgpt_session_ready(chatgpt):
@@ -6168,7 +6671,10 @@ def _reuse_one_standby(
                 auth_data = json.loads(read_text(Path(auth_file)))
                 access_token = auth_data.get("access_token")
                 if access_token:
-                    status_str, info = quota_callable(access_token)
+                    status_str, info = quota_callable(
+                        access_token,
+                        account_id=auth_data.get("account_id") or None,
+                    )
                     if status_str == "exhausted":
                         quota_info = quota_result_quota_info(info)
                         if quota_info:
@@ -6185,23 +6691,10 @@ def _reuse_one_standby(
                         logger.info("[4/5] 跳过 %s（临时网络错误,本轮无法验证额度）", email)
                         return {"email": email, "result": "skipped_quota", "error": None}
                     if status_str == "auth_error":
-                        lq = acc.get("last_quota")
-                        if lq:
-                            exhausted_info = _pending_historical_exhausted_info(lq)
-                            if exhausted_info:
-                                window_label = _quota_window_label(exhausted_info.get("window"))
-                                logger.info("[4/5] 跳过 %s（%s额度未恢复）", email, window_label)
-                                return {"email": email, "result": "skipped_quota", "error": None}
-                            p_resets = lq.get("primary_resets_at", 0)
-                            if p_resets and current_ts >= p_resets:
-                                logger.info("[4/5] %s 的 5h 重置时间已过，视为额度已恢复", email)
-                                quota_ok = True
-                            else:
-                                p_remain = 100 - lq.get("primary_pct", 0)
-                                if p_remain < threshold:
-                                    logger.info("[4/5] 跳过 %s（上次额度 %d%% < %d%%）", email, p_remain, threshold)
-                                    return {"email": email, "result": "skipped_quota", "error": None}
-                                quota_ok = True
+                        if _allow_reuse_on_auth_error(acc, threshold, now=current_ts, stage_label="[4/5]"):
+                            quota_ok = True
+                        else:
+                            return {"email": email, "result": "skipped_quota", "error": None}
             except Exception:
                 pass
 
@@ -6360,13 +6853,33 @@ def cmd_rotate(target_seats=3, force_auth_repair=False, background_post_sync=Fal
             )
             return ensure_mail()
 
+    try:
+        from autoteam.config import ROTATE_PAUSE_ON_MASTER_CANCELLED
+        from autoteam.master_health import is_master_subscription_healthy
+
+        if ROTATE_PAUSE_ON_MASTER_CANCELLED:
+            probe = ensure_chatgpt()
+            healthy, reason, evidence = is_master_subscription_healthy(probe)
+            if not healthy and reason == "subscription_cancelled":
+                logger.error(
+                    "[轮转] master workspace subscription_cancelled，暂停轮转/补位；"
+                    "避免继续 invite/kick 洗掉 Team OAuth。account_id=%s role=%s",
+                    (evidence or {}).get("account_id"),
+                    (evidence or {}).get("current_user_role"),
+                )
+                raise RuntimeError("master subscription_cancelled; rotate/fill paused until Team subscription is reactivated")
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        logger.warning("[轮转] master health preflight 异常，按既有流程继续: %s", exc)
+
     logger.info("[1/5] 同步 Team 状态...")
     _bump("rotate:sync_team")
     sync_account_states()
 
     logger.info("[2/5] 检查额度...")
     _bump("rotate:check_quota")
-    cmd_check()
+    cmd_check(force_auth_repair=force_auth_repair)
 
     # Round 12 S5 — 预测式抢先替换(可选,默认关).
     # 仅当 PREDICTIVE_ENABLED=true 时执行: 遍历 ACTIVE 子号,基于 quota_history
@@ -6400,7 +6913,7 @@ def cmd_rotate(target_seats=3, force_auth_repair=False, background_post_sync=Fal
                     email = acc["email"]
                     remove_status = remove_from_team(chatgpt, email, return_status=True)
                     if remove_status in ("removed", "already_absent"):
-                        update_account(email, status=STATUS_STANDBY, _reason="predictive_preempt")
+                        _mark_standby_after_team_exit(email, reason="predictive_preempt")
                         logger.info("[2.5/5] %s → standby（预测式抢先,lead=%dmin）", email, PREDICTIVE_LEAD_MIN)
             else:
                 logger.debug("[2.5/5] 预测式: 无 ACTIVE 子号需要抢先替换")
@@ -6418,6 +6931,7 @@ def cmd_rotate(target_seats=3, force_auth_repair=False, background_post_sync=Fal
         initial_api_count = -1
         removed_now = 0
         already_absent_count = 0
+        removed_blocker_emails: set[str] = set()
 
         if all_exhausted:
             logger.info("[3/5] 移出 %d 个不可用占席账号...", len(all_exhausted))
@@ -6432,7 +6946,10 @@ def cmd_rotate(target_seats=3, force_auth_repair=False, background_post_sync=Fal
                     chatgpt.start()
                 remove_status = remove_from_team(chatgpt, email, return_status=True)
                 if remove_status in ("removed", "already_absent"):
-                    update_account(email, status=STATUS_STANDBY, _reason=reason)
+                    _mark_standby_after_team_exit(email, reason=reason)
+                    normalized_removed = _normalized_email(email)
+                    if normalized_removed:
+                        removed_blocker_emails.add(normalized_removed)
                     if remove_status == "removed":
                         removed_now += 1
                         logger.info("[3/5] %s → standby（已从 Team 移出）| reason=%s", email, reason)
@@ -6504,7 +7021,7 @@ def cmd_rotate(target_seats=3, force_auth_repair=False, background_post_sync=Fal
                         break
                     email = acc["email"]
                     if remove_from_team(chatgpt, email):
-                        update_account(email, status=STATUS_STANDBY)
+                        _mark_standby_after_team_exit(email, reason="over_capacity_cleanup")
                         logger.info("[4/5] 超员清理: %s → standby", email)
                         removed += 1
                 if removed:
@@ -6520,7 +7037,12 @@ def cmd_rotate(target_seats=3, force_auth_repair=False, background_post_sync=Fal
         # 否则保持串行(向后兼容老行为). 每席位独立 try/except 在 _reuse_one_standby
         # 内已收敛 → result ∈ {reused / skipped_quota / skipped_auto / failed}.
         filled = 0
-        standby_list = [a for a in get_standby_accounts() if not _is_main_account_email(a.get("email"))]
+        standby_list = [
+            a
+            for a in get_standby_accounts()
+            if not _is_main_account_email(a.get("email"))
+            and _normalized_email(a.get("email")) not in removed_blocker_emails
+        ]
         quota_skipped: list[dict] = []
         auto_reuse_skipped: list[dict] = []
 
@@ -6534,7 +7056,7 @@ def cmd_rotate(target_seats=3, force_auth_repair=False, background_post_sync=Fal
             logger.info("[4/5] ROTATE_SKIP_REUSE 启用：跳过 standby 复用，直接创建新账号补位")
             candidates = []
         else:
-            candidates = list(standby_list)
+            candidates = _select_reuse_candidates(standby_list, threshold, stage_label="[4/5]")
 
         def _chatgpt_provider():
             if not chatgpt or not _chatgpt_session_ready(chatgpt):
@@ -6680,7 +7202,7 @@ def cmd_rotate(target_seats=3, force_auth_repair=False, background_post_sync=Fal
                         chatgpt.start()
                     remove_status = remove_from_team(chatgpt, created_email, return_status=True)
                     if remove_status in ("removed", "already_absent"):
-                        update_account(created_email, status=STATUS_STANDBY, _reason="new_account_not_ready")
+                        _mark_standby_after_team_exit(created_email, reason="new_account_not_ready")
 
         if not chatgpt or not _chatgpt_session_ready(chatgpt):
             ensure_chatgpt()
@@ -7020,13 +7542,17 @@ def cmd_fill(target=3, leave_workspace=False, *, post_sync=True, print_status=Tr
             logger.info("[填充] ROTATE_SKIP_REUSE 启用：不复用旧账号，只创建新账号补位")
             standby_list = []
         else:
-            standby_list = [
-                a
-                for a in get_standby_accounts()
-                if a.get("_quota_recovered")
-                and not _is_main_account_email(a.get("email"))
-                and not is_account_disabled(a)
-            ]
+            standby_list = _select_reuse_candidates(
+                [
+                    a
+                    for a in get_standby_accounts()
+                    if a.get("_quota_recovered")
+                    and not _is_main_account_email(a.get("email"))
+                    and not is_account_disabled(a)
+                ],
+                AUTO_CHECK_THRESHOLD,
+                stage_label="[填充]",
+            )
         standby_index = 0
 
         from autoteam import cancel_signal
@@ -7081,7 +7607,7 @@ def cmd_fill(target=3, leave_workspace=False, *, post_sync=True, print_status=Tr
                         chatgpt.start()
                     remove_status = remove_from_team(chatgpt, created_email, return_status=True)
                     if remove_status in ("removed", "already_absent"):
-                        update_account(created_email, status=STATUS_STANDBY, _reason="fill_new_account_not_ready")
+                        _mark_standby_after_team_exit(created_email, reason="fill_new_account_not_ready")
 
             if not added:
                 logger.warning("[填充] 本轮补位失败，第 %d/%d 个空缺仍未填上", i + 1, need)
@@ -7639,7 +8165,7 @@ def cmd_cleanup(max_seats=None):
 
             if result["status"] in (200, 204):
                 logger.info("[清理] 已移除 %s", email)
-                update_account(email, status=STATUS_STANDBY)
+                _mark_standby_after_team_exit(email, reason="manual_cleanup")
             else:
                 logger.error("[清理] 移除 %s 失败: %d", email, result["status"])
 

@@ -45,7 +45,7 @@ def test_infer_mail_provider_from_email_uses_matching_domain(monkeypatch):
     assert mail_module.infer_mail_provider_from_email("user@unknown.example.com") == ""
 
 
-def test_sync_to_cpa_skips_disabled_accounts_and_keeps_protected_remote(monkeypatch, tmp_path):
+def test_sync_to_cpa_skips_disabled_accounts_and_keeps_remote_when_active_pool_is_unstable(monkeypatch, tmp_path):
     enabled_auth = tmp_path / "codex-enabled@example.com-team-a.json"
     disabled_auth = tmp_path / "codex-disabled@example.com-team-b.json"
     enabled_auth.write_text('{"access_token":"token-enabled"}', encoding="utf-8")
@@ -151,7 +151,7 @@ def test_sync_to_cpa_allows_remote_delete_when_active_pool_is_stable(monkeypatch
     assert result["delete_guard"]["skipped_remote_delete"] == 0
 
 
-def test_sync_to_cpa_preserves_credential_seat_when_remote_delete_is_allowed(monkeypatch, tmp_path):
+def test_sync_to_cpa_deletes_auth_invalid_remote_backup_when_remote_delete_is_allowed(monkeypatch, tmp_path):
     active_auth = tmp_path / "codex-active@example.com-team-a.json"
     second_active_auth = tmp_path / "codex-second-active@example.com-team-c.json"
     protected_auth = tmp_path / "codex-protected@example.com-team-b.json"
@@ -212,9 +212,9 @@ def test_sync_to_cpa_preserves_credential_seat_when_remote_delete_is_allowed(mon
     result = cpa_sync.sync_to_cpa()
 
     assert uploaded == [active_auth.name, second_active_auth.name]
-    assert deleted == []
+    assert deleted == [protected_auth.name]
     assert result["delete_guard"]["allow_remote_delete"] is True
-    assert result["delete_guard"]["skipped_protected"] == 1
+    assert result["delete_guard"]["skipped_protected"] == 0
 
 
 def test_sync_to_cpa_skips_exhausted_active_credential_before_upload(monkeypatch, tmp_path):
@@ -286,6 +286,24 @@ def test_sync_to_cpa_skips_exhausted_active_credential_before_upload(monkeypatch
     assert result["delete_guard"]["allow_remote_delete"] is True
 
 
+def test_active_auth_publish_decision_uses_auth_file_account_id(monkeypatch, tmp_path):
+    auth_file = tmp_path / "codex-child@example.com-team-a.json"
+    auth_file.write_text(
+        '{"email":"child@example.com","access_token":"token-child","account_id":"acct-child"}',
+        encoding="utf-8",
+    )
+    calls = []
+
+    def fake_quota(access_token, **kwargs):
+        calls.append((access_token, kwargs.get("account_id")))
+        return "ok", {"primary_pct": 1}
+
+    monkeypatch.setattr("autoteam.codex_auth.check_codex_quota", fake_quota)
+
+    assert cpa_sync._active_auth_publish_decision({"email": "child@example.com"}, auth_file) == "publish"
+    assert calls == [("token-child", "acct-child")]
+
+
 def test_sync_to_cpa_keeps_remote_on_active_quota_network_error(monkeypatch, tmp_path):
     auth_file = tmp_path / "codex-active@example.com-team-a.json"
     auth_file.write_text('{"email":"active@example.com","access_token":"token-active"}', encoding="utf-8")
@@ -311,6 +329,42 @@ def test_sync_to_cpa_keeps_remote_on_active_quota_network_error(monkeypatch, tmp
     assert result["synced_active"] == 0
     assert result["active_publish"]["kept_remote"] == 1
     assert result["delete_guard"]["allow_remote_delete"] is False
+
+
+def test_delete_from_cpa_downloads_backup_before_remote_delete(monkeypatch, tmp_path):
+    auth_dir = tmp_path / "auths"
+    auth_dir.mkdir()
+    monkeypatch.setattr(cpa_sync, "AUTH_DIR", auth_dir)
+    monkeypatch.setattr(cpa_sync, "CPA_BACKUP_DIR", tmp_path / "cpa_backups")
+    monkeypatch.setattr(cpa_sync, "download_from_cpa", lambda name: '{"email":"user@example.com","token":"x"}')
+
+    class _Resp:
+        status_code = 200
+        text = "ok"
+
+    monkeypatch.setattr(cpa_sync.requests, "delete", lambda *_args, **_kwargs: _Resp())
+
+    assert cpa_sync.delete_from_cpa("codex-user@example.com-team.json") is True
+
+    backups = list((tmp_path / "cpa_backups").rglob("*.json"))
+    assert any(p.name.endswith("codex-user@example.com-team.json") for p in backups)
+    meta_files = list((tmp_path / "cpa_backups").rglob("*.meta.json"))
+    assert meta_files
+
+
+def test_delete_from_cpa_skips_remote_delete_when_backup_download_fails(monkeypatch):
+    monkeypatch.setattr(cpa_sync, "download_from_cpa", lambda _name: None)
+
+    called = {"delete": 0}
+
+    def fake_delete(*_args, **_kwargs):
+        called["delete"] += 1
+        raise AssertionError("delete request must not run without a local backup")
+
+    monkeypatch.setattr(cpa_sync.requests, "delete", fake_delete)
+
+    assert cpa_sync.delete_from_cpa("codex-user@example.com-team.json") is False
+    assert called["delete"] == 0
 
 
 def test_sync_to_cpa_refreshes_proxy_url_before_upload(monkeypatch, tmp_path):
@@ -344,3 +398,43 @@ def test_sync_to_cpa_refreshes_proxy_url_before_upload(monkeypatch, tmp_path):
 
     assert result["uploaded"] == 1
     assert '"proxy_url": "socks5://proxy.example:30000"' in uploaded[0]
+
+
+def test_sync_to_cpa_never_uploads_or_keeps_main_account_auth(monkeypatch, tmp_path):
+    main_auth = tmp_path / "codex-main@example.com-free-a.json"
+    child_auth = tmp_path / "codex-child@example.com-team-b.json"
+    main_auth.write_text('{"email":"main@example.com","access_token":"token-main"}', encoding="utf-8")
+    child_auth.write_text('{"email":"child@example.com","access_token":"token-child"}', encoding="utf-8")
+
+    monkeypatch.setattr(
+        "autoteam.accounts.load_accounts",
+        lambda: [
+            {"email": "main@example.com", "status": "active", "auth_file": str(main_auth), "disabled": False},
+            {"email": "child@example.com", "status": "active", "auth_file": str(child_auth), "disabled": False},
+        ],
+    )
+    monkeypatch.setattr("autoteam.accounts.save_accounts", lambda _accounts: None)
+    monkeypatch.setattr(cpa_sync, "_cleanup_local_duplicates", lambda _accounts: (0, False))
+    monkeypatch.setattr("autoteam.accounts._is_main_account_email", lambda email: email == "main@example.com")
+    monkeypatch.setattr(
+        cpa_sync,
+        "list_cpa_files",
+        lambda: [
+            {"name": main_auth.name, "email": "main@example.com"},
+            {"name": child_auth.name, "email": "child@example.com"},
+        ],
+    )
+
+    uploaded = []
+    deleted = []
+    monkeypatch.setattr("autoteam.codex_auth.check_codex_quota", lambda *_args, **_kwargs: ("ok", {}))
+    monkeypatch.setattr(cpa_sync, "upload_to_cpa", lambda path: uploaded.append(Path(path).name) or True)
+    monkeypatch.setattr(cpa_sync, "delete_from_cpa", lambda name: deleted.append(name) or True)
+
+    result = cpa_sync.sync_to_cpa()
+
+    assert uploaded == [child_auth.name]
+    assert deleted == []
+    assert result["synced_active"] == 1
+    assert result["delete_guard"]["allow_remote_delete"] is False
+    assert result["delete_guard"]["skipped_remote_delete"] == 1

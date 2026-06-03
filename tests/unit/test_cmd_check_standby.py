@@ -296,3 +296,37 @@ def test_probe_auth_error_only_for_401_403(monkeypatch):
     assert status == "ok"
     assert isinstance(info, dict)
     assert info["primary_pct"] == 10
+
+
+def test_check_codex_quota_forwards_custom_timeout(monkeypatch):
+    """check_codex_quota(timeout=...) 必须透传到底层 requests.get，避免 CPA 调用再抛 unexpected keyword。"""
+    from autoteam import codex_auth
+
+    healthy = {
+        "rate_limit": {
+            "primary_window": {"used_percent": 10, "reset_at": 0},
+            "secondary_window": {"used_percent": 5, "reset_at": 0},
+            "limit_reached": False,
+        }
+    }
+    seen = {}
+
+    class FakeResp:
+        status_code = 200
+
+        def json(self):
+            return healthy
+
+    def fake_get(*_args, **kwargs):
+        seen.update(kwargs)
+        return FakeResp()
+
+    monkeypatch.setattr(codex_auth, "get_chatgpt_account_id", lambda: "acc-timeout")
+    monkeypatch.setattr("requests.get", fake_get)
+
+    status, info = codex_auth.check_codex_quota("tok", timeout=8)
+
+    assert status == "ok"
+    assert isinstance(info, dict)
+    assert seen["timeout"] == 8
+    assert seen["headers"]["Chatgpt-Account-Id"] == "acc-timeout"

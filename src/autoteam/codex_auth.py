@@ -624,6 +624,25 @@ def _session_token_supports_team_quota(page, session_token, account_id):
     return False
 
 
+def _session_token_is_exportable_team_credential(session_token, account_id, *, stage_label: str) -> bool:
+    """Return True only when the token works without browser cookies.
+
+    ChatGPT web session tokens can be valid inside the page because cookies are
+    present, but CPA/CLIProxy only receives the Bearer token. Accepting a
+    cookie-dependent token creates an auth file that immediately fails
+    wham/usage remotely.
+    """
+    quota_status, _quota_info = check_codex_quota(session_token, account_id=account_id, timeout=10)
+    if quota_status == "ok":
+        return True
+    logger.info(
+        "[Codex-Fallback] %s session token rejected for export: bearer wham/usage=%s",
+        stage_label,
+        quota_status,
+    )
+    return False
+
+
 def _fetch_team_session_bundle_from_context(
     context,
     email: str,
@@ -656,26 +675,28 @@ def _fetch_team_session_bundle_from_context(
             )
             token = session.get("accessToken") if isinstance(session, dict) else None
             if _is_valid_team_access_token(token, account_id):
-                bundle = _bundle_from_access_token(token, email, account_id)
-                logger.info(
-                    "[Codex-Fallback] %s 获取到 ChatGPT Team session token: email=%s plan=%s",
-                    stage_label,
-                    bundle.get("email") or email,
-                    bundle.get("plan_type"),
-                )
-                return bundle
+                if _session_token_is_exportable_team_credential(token, account_id, stage_label=stage_label):
+                    bundle = _bundle_from_access_token(token, email, account_id)
+                    logger.info(
+                        "[Codex-Fallback] %s 获取到可导出的 ChatGPT Team session token: email=%s plan=%s",
+                        stage_label,
+                        bundle.get("email") or email,
+                        bundle.get("plan_type"),
+                    )
+                    return bundle
 
             if token and _session_token_supports_team_quota(page, token, account_id):
-                bundle = _bundle_from_session_token(token, email, account_id)
-                bundle["plan_type"] = "team"
-                bundle["plan_supported"] = True
-                logger.info(
-                    "[Codex-Fallback] %s JWT claims 未切到 Team，但 wham/usage 已验证目标 Team 可用: email=%s account=%s",
-                    stage_label,
-                    bundle.get("email") or email,
-                    account_id,
-                )
-                return bundle
+                if _session_token_is_exportable_team_credential(token, account_id, stage_label=stage_label):
+                    bundle = _bundle_from_session_token(token, email, account_id)
+                    bundle["plan_type"] = "team"
+                    bundle["plan_supported"] = True
+                    logger.info(
+                        "[Codex-Fallback] %s JWT claims 未切到 Team，但 bearer wham/usage 已验证目标 Team 可用: email=%s account=%s",
+                        stage_label,
+                        bundle.get("email") or email,
+                        account_id,
+                    )
+                    return bundle
 
             if token:
                 claims = _parse_jwt_payload(token)
@@ -940,6 +961,48 @@ def _build_auth_url_with_allowed_workspace(code_challenge, state, allowed_worksp
         return base
     sep = "&" if "?" in base else "?"
     return f"{base}{sep}allowed_workspace_id={urllib.parse.quote(allowed_workspace_id, safe='')}"
+
+
+def _extract_auth_code_from_callback_url(url: str | None) -> str | None:
+    url = str(url or "")
+    if f"localhost:{CODEX_CALLBACK_PORT}/auth/callback" not in url:
+        return None
+    parsed = urllib.parse.urlparse(url)
+    qs = urllib.parse.parse_qs(parsed.query)
+    return qs.get("code", [None])[0]
+
+
+def _attach_auth_code_capture_to_page(page, set_auth_code) -> None:
+    def _capture(url: str | None, source: str) -> None:
+        code = _extract_auth_code_from_callback_url(url)
+        if code:
+            set_auth_code(code, source)
+
+    page.on("request", lambda request: _capture(request.url, "request"))
+    page.on("response", lambda response: _capture(response.url, "response"))
+    page.on("framenavigated", lambda frame: _capture(frame.url, "frame"))
+
+
+def _scan_context_pages_for_auth_code(context, set_auth_code) -> bool:
+    found = False
+    for page in list(getattr(context, "pages", []) or []):
+        try:
+            code = _extract_auth_code_from_callback_url(page.url)
+        except Exception:
+            code = None
+        if code:
+            set_auth_code(code, "page")
+            found = True
+            break
+        try:
+            for frame in page.frames:
+                code = _extract_auth_code_from_callback_url(frame.url)
+                if code:
+                    set_auth_code(code, "frame-scan")
+                    return True
+        except Exception:
+            continue
+    return found
 
 
 def _write_auth_file(filepath, bundle):
@@ -1238,6 +1301,64 @@ def _select_oauth_account(page, email: str | None) -> bool:
     return False
 
 
+def _wait_for_oauth_account_selection_progress(page, timeout: float = 12.0) -> bool:
+    deadline = time.time() + max(0.5, float(timeout))
+    while time.time() < deadline:
+        try:
+            current_url = (page.url or "").lower()
+        except Exception:
+            current_url = ""
+
+        if f"localhost:{CODEX_CALLBACK_PORT}/auth/callback" in current_url:
+            return True
+        if any(marker in current_url for marker in ("consent", "organization", "workspace")):
+            return True
+
+        try:
+            if not _is_choose_account_page(page):
+                return True
+        except Exception:
+            return True
+
+        try:
+            consent_btn = page.locator(
+                'button:has-text("Continue"), button:has-text("继续"), button:has-text("Allow")'
+            ).first
+            if consent_btn.is_visible(timeout=250):
+                return True
+        except Exception:
+            pass
+
+        time.sleep(0.5)
+
+    try:
+        return not _is_choose_account_page(page)
+    except Exception:
+        return True
+
+
+def _resolve_team_session_fallback_bundle(
+    context,
+    email: str,
+    account_id: str | None,
+    *,
+    stage_label: str,
+    attempts: int = 3,
+) -> dict | None:
+    """Try to bypass auth.openai.com when ChatGPT Team session is already usable."""
+    try:
+        return _fetch_team_session_bundle_from_context(
+            context,
+            email,
+            account_id,
+            stage_label=stage_label,
+            attempts=attempts,
+        )
+    except Exception as exc:
+        logger.warning("[Codex-Fallback] %s session bundle 检查异常: %s", stage_label, exc)
+        return None
+
+
 def _select_choose_account(page, email: str | None) -> bool:
     return _select_oauth_account(page, email)
 
@@ -1302,6 +1423,14 @@ def _recover_oauth_no_valid_organizations_page(page) -> bool:
             continue
 
     return False
+
+
+def _recover_oauth_transient_error_page(page) -> str | None:
+    if _recover_oauth_no_valid_organizations_page(page):
+        return "no_valid_organizations"
+    if _recover_oauth_timeout_page(page):
+        return "oauth_timeout"
+    return None
 
 
 def _is_oauth_login_challenge_page(page, trace_events=None) -> bool:
@@ -2072,6 +2201,8 @@ def login_codex_via_browser(
     )
 
     auth_code = None
+    last_oauth_failure_url = ""
+    last_oauth_failure_excerpt = ""
     # Round 11 V8 — personal UUID 在 silent step-0 / stage2 re-login 完成后通过
     # POST /backend-api/accounts/personal getOrCreate 拿到,之后用 allowed_workspace_id
     # 注入 OAuth /authorize URL,绕过 default_workspace_id sticky-Team 死锁。
@@ -2392,18 +2523,19 @@ def login_codex_via_browser(
             except Exception:
                 pass
 
-            # 可能需要邮箱验证码
+            # 可能需要邮箱验证码 / 登录挑战，统一走 challenge helper，避免验证码页分叉逻辑漂移。
             try:
-                if mail_client and _is_otp_input_visible(_page, timeout=5000):
-                    _resolve_email_verification(
+                if _is_oauth_login_challenge_page(_page) or _is_otp_input_visible(_page, timeout=500):
+                    acted = _complete_oauth_login_challenge(
                         _page,
-                        mail_client=mail_client,
-                        email=email,
-                        after_email_id=_email_id_before_login,
-                        used_email_ids=_used_email_ids,
-                        wait_log="[Codex] ChatGPT 登录需要验证码，等待 emailId > %d 的新邮件...",
+                        email,
+                        password,
+                        mail_client,
+                        _email_id_before_login,
+                        _used_email_ids,
                     )
-                    time.sleep(5)
+                    if acted:
+                        time.sleep(5)
             except Exception:
                 pass
 
@@ -2443,32 +2575,39 @@ def login_codex_via_browser(
                 _screenshot(_page, "codex_00_after_workspace.png")
                 logger.info("[Codex] 选择 workspace 后 URL: %s", _page.url)
 
+            if not use_personal:
+                session_fallback_bundle = _resolve_team_session_fallback_bundle(
+                    context,
+                    email,
+                    chatgpt_account_id,
+                    stage_label="post-chatgpt-login",
+                    attempts=5,
+                )
+                if session_fallback_bundle:
+                    close_playwright_objects(
+                        _page,
+                        context,
+                        browser,
+                        logger=logger,
+                        label="codex-post-login-session-fallback",
+                    )
+                    if return_result:
+                        return _oauth_result_from_bundle(session_fallback_bundle)
+                    return session_fallback_bundle
+
             # _account cookie 已在登录前注入
 
             # 关闭 ChatGPT 页面但保留 context
             close_playwright_objects(page=_page, logger=logger, label="codex-workspace-page")
 
-        # 通过监听请求来捕获 OAuth callback redirect
-        def on_request(request):
+        def _set_auth_code(value: str | None, source: str) -> None:
             nonlocal auth_code
-            url = request.url
-            if f"localhost:{CODEX_CALLBACK_PORT}/auth/callback" in url:
-                parsed = urllib.parse.urlparse(url)
-                qs = urllib.parse.parse_qs(parsed.query)
-                auth_code = qs.get("code", [None])[0]
-                if auth_code:
-                    logger.info("[Codex] 捕获到 auth code!")
+            if value and not auth_code:
+                auth_code = value
+                logger.info("[Codex] 从 %s 捕获到 auth code!", source)
 
-        # 也监听 response/framenavigated 来捕获 redirect URL
-        def on_response(response):
-            nonlocal auth_code
-            url = response.url
-            if f"localhost:{CODEX_CALLBACK_PORT}/auth/callback" in url and not auth_code:
-                parsed = urllib.parse.urlparse(url)
-                qs = urllib.parse.parse_qs(parsed.query)
-                auth_code = qs.get("code", [None])[0]
-                if auth_code:
-                    logger.info("[Codex] 从 response 捕获到 auth code!")
+        def _attach_to_new_page(new_page) -> None:
+            _attach_auth_code_capture_to_page(new_page, _set_auth_code)
 
         # Round 11 V8 — 拿到 personal UUID 后,把 OAuth /authorize URL 拼上 allowed_workspace_id,
         # 让 issuer 在颁 token 时优先选 personal workspace 而非 default_workspace_id 指向的 Team。
@@ -2480,8 +2619,8 @@ def login_codex_via_browser(
             )
 
         page = context.new_page()
-        page.on("request", on_request)
-        page.on("response", on_response)
+        context.on("page", _attach_to_new_page)
+        _attach_auth_code_capture_to_page(page, _set_auth_code)
         page.goto(auth_url, wait_until="domcontentloaded", timeout=60000)
         time.sleep(3)
         _screenshot(page, "codex_01_auth_page.png")
@@ -2532,55 +2671,22 @@ def login_codex_via_browser(
         except Exception:
             _screenshot(page, "codex_03_no_password.png")
 
-        # 可能需要邮箱登录验证码
+        # 可能需要邮箱登录验证码 / 登录挑战
         _screenshot(page, "codex_03b_check_otp.png")
-        code_input = None
         try:
-            code_input = page.locator(
-                'input[name="code"], input[placeholder*="验证码"], input[placeholder*="code" i]'
-            ).first
-            if not code_input.is_visible(timeout=5000):
-                code_input = None
+            if _is_oauth_login_challenge_page(page) or _is_otp_input_visible(page, timeout=500):
+                acted = _complete_oauth_login_challenge(
+                    page,
+                    email,
+                    password,
+                    mail_client,
+                    _email_id_before_login,
+                    _used_email_ids,
+                )
+                if acted:
+                    _screenshot(page, "codex_03c_after_otp.png")
         except Exception:
-            code_input = None
-
-        if code_input and mail_client:
-            logger.info("[Codex] 需要登录验证码，等待 emailId > %d 的新邮件...", _email_id_before_login)
-
-            start_t = time.time()
-            otp_code = None
-            otp_email_id = 0
-            while time.time() - start_t < 120:
-                emails = mail_client.search_emails_by_recipient(email, size=5)
-                for em in emails:
-                    email_id = em.get("emailId", 0)
-                    if email_id <= _email_id_before_login or email_id in _used_email_ids:
-                        continue
-                    subj = em.get("subject", "").lower()
-                    if "invited" in subj or "invitation" in subj:
-                        continue
-                    otp_code = mail_client.extract_verification_code(em)
-                    if otp_code:
-                        otp_email_id = email_id
-                        break
-                if otp_code:
-                    break
-                time.sleep(3)
-
-            if otp_code:
-                _used_email_ids.add(otp_email_id)
-                logger.info("[Codex] 获取到验证码: %s", otp_code)
-                code_input.fill(otp_code)
-                time.sleep(0.5)
-                page.locator(
-                    'button:has-text("Continue"), button:has-text("继续"), button[type="submit"]'
-                ).first.click()
-                time.sleep(5)
-                _screenshot(page, "codex_03c_after_otp.png")
-            else:
-                logger.warning("[Codex] 未获取到验证码")
-        elif code_input:
-            logger.warning("[Codex] 需要验证码但无 mail_client，无法自动获取")
+            pass
 
         # SPEC-2 shared/add-phone-detection §4 (位点 C-P1):about-you 入口前先探针。
         # 注册流程提交 OTP 后 OpenAI 经常把账号引到 add-phone,等切到 about-you 再发现就太晚。
@@ -2675,16 +2781,60 @@ def login_codex_via_browser(
 
             _screenshot(page, f"codex_04_step{step + 1}_before.png")
 
+            recovered_error = _recover_oauth_transient_error_page(page)
+            if recovered_error:
+                logger.info("[Codex] consent loop 命中 %s，已点击恢复按钮，继续当前 OAuth 流程", recovered_error)
+                _screenshot(page, f"codex_04_recovered_{recovered_error}_{step + 1}.png")
+                continue
+
             try:
                 if _is_choose_account_page(page):
                     _screenshot(page, f"codex_04_choose_account_{step + 1}_before.png")
                     logger.info("[Codex] 检测到账号选择页 (step %d)，尝试选择: %s", step + 1, email)
                     selected = _select_oauth_account(page, email)
                     _screenshot(page, f"codex_04_choose_account_{step + 1}_after.png")
-                    if selected and not _is_choose_account_page(page):
+                    if selected:
+                        progressed = _wait_for_oauth_account_selection_progress(page, timeout=12)
+                        if not progressed:
+                            logger.warning("[Codex] OAuth 账号选择后页面未推进，下一轮继续等待/重试 (step %d)", step + 1)
+                            if not use_personal:
+                                session_fallback_bundle = _resolve_team_session_fallback_bundle(
+                                    context,
+                                    email,
+                                    chatgpt_account_id,
+                                    stage_label=f"choose-account-stall-step-{step + 1}",
+                                    attempts=2,
+                                )
+                                if session_fallback_bundle:
+                                    close_playwright_objects(
+                                        page,
+                                        context,
+                                        browser,
+                                        logger=logger,
+                                        label="codex-choose-account-session-fallback",
+                                    )
+                                    if return_result:
+                                        return _oauth_result_from_bundle(session_fallback_bundle)
+                                    return session_fallback_bundle
                         continue
                     if not selected:
                         logger.warning("[Codex] 无法自动选择 OAuth 账号: %s (step %d)", email, step + 1)
+            except Exception:
+                pass
+
+            try:
+                if _is_oauth_login_challenge_page(page):
+                    acted = _complete_oauth_login_challenge(
+                        page,
+                        email,
+                        password,
+                        mail_client,
+                        _email_id_before_login,
+                        _used_email_ids,
+                    )
+                    if acted:
+                        _screenshot(page, f"codex_04_login_challenge_{step + 1}.png")
+                        continue
             except Exception:
                 pass
 
@@ -2963,21 +3113,22 @@ def login_codex_via_browser(
         for _ in range(30):
             if auth_code:
                 break
+            if _scan_context_pages_for_auth_code(context, _set_auth_code):
+                break
             # 也从当前 URL 尝试提取（CPA 可能接收了回调）
             try:
                 cur = page.url
-                if f"localhost:{CODEX_CALLBACK_PORT}/auth/callback" in cur:
-                    parsed = urllib.parse.urlparse(cur)
-                    qs = urllib.parse.parse_qs(parsed.query)
-                    auth_code = qs.get("code", [None])[0]
-                    if auth_code:
-                        logger.info("[Codex] 从 URL 捕获到 auth code!")
-                        break
+                code = _extract_auth_code_from_callback_url(cur)
+                if code:
+                    _set_auth_code(code, "url")
+                    break
             except Exception:
                 pass
             time.sleep(1)
 
         if not auth_code:
+            last_oauth_failure_url = page.url or ""
+            last_oauth_failure_excerpt = _page_excerpt(page, limit=500)
             _screenshot(page, "codex_05_no_callback.png")
             logger.warning("[Codex] 未获取到 auth code，当前 URL: %s", page.url)
 
@@ -3110,32 +3261,14 @@ def login_codex_via_browser(
             # 3) 重新走 OAuth — 在同一 context 内开新 page 监听 callback
             stage2_auth_code = None
 
-            def _on_request_stage2(request):
+            def _set_stage2_auth_code(value: str | None, source: str) -> None:
                 nonlocal stage2_auth_code
-                url = request.url
-                if f"localhost:{CODEX_CALLBACK_PORT}/auth/callback" in url:
-                    parsed = urllib.parse.urlparse(url)
-                    qs = urllib.parse.parse_qs(parsed.query)
-                    stage2_auth_code = qs.get("code", [None])[0]
-                    if stage2_auth_code:
-                        logger.info("[Codex] 阶段 2 捕获到 auth code!")
-
-            def _on_response_stage2(response):
-                nonlocal stage2_auth_code
-                url = response.url
-                if (
-                    f"localhost:{CODEX_CALLBACK_PORT}/auth/callback" in url
-                    and not stage2_auth_code
-                ):
-                    parsed = urllib.parse.urlparse(url)
-                    qs = urllib.parse.parse_qs(parsed.query)
-                    stage2_auth_code = qs.get("code", [None])[0]
-                    if stage2_auth_code:
-                        logger.info("[Codex] 阶段 2 从 response 捕获到 auth code!")
+                if value and not stage2_auth_code:
+                    stage2_auth_code = value
+                    logger.info("[Codex] 阶段 2从 %s 捕获到 auth code!", source)
 
             stage2_page = context.new_page()
-            stage2_page.on("request", _on_request_stage2)
-            stage2_page.on("response", _on_response_stage2)
+            _attach_auth_code_capture_to_page(stage2_page, _set_stage2_auth_code)
             try:
                 stage2_page.goto(stage2_auth_url, wait_until="domcontentloaded", timeout=60000)
                 time.sleep(3)
@@ -3156,6 +3289,34 @@ def login_codex_via_browser(
                         raise
 
                     _screenshot(stage2_page, f"codex_relogin_07_consent_step{s2_step + 1}.png")
+
+                    recovered_error = _recover_oauth_transient_error_page(stage2_page)
+                    if recovered_error:
+                        logger.info(
+                            "[Codex] 阶段 2 consent loop 命中 %s，已点击恢复按钮，继续当前 OAuth 流程",
+                            recovered_error,
+                        )
+                        _screenshot(
+                            stage2_page,
+                            f"codex_relogin_07_recovered_{recovered_error}_{s2_step + 1}.png",
+                        )
+                        continue
+
+                    try:
+                        if _is_oauth_login_challenge_page(stage2_page):
+                            acted = _complete_oauth_login_challenge(
+                                stage2_page,
+                                email,
+                                password,
+                                mail_client,
+                                _email_id_before_login,
+                                _used_email_ids,
+                            )
+                            if acted:
+                                _screenshot(stage2_page, f"codex_relogin_07_login_challenge_{s2_step + 1}.png")
+                                continue
+                    except Exception:
+                        pass
 
                     # workspace 选择页(personal 路径)
                     try:
@@ -3201,15 +3362,14 @@ def login_codex_via_browser(
                 for _ in range(30):
                     if stage2_auth_code:
                         break
+                    if _scan_context_pages_for_auth_code(context, _set_stage2_auth_code):
+                        break
                     try:
                         cur2 = stage2_page.url
-                        if f"localhost:{CODEX_CALLBACK_PORT}/auth/callback" in cur2:
-                            parsed = urllib.parse.urlparse(cur2)
-                            qs = urllib.parse.parse_qs(parsed.query)
-                            stage2_auth_code = qs.get("code", [None])[0]
-                            if stage2_auth_code:
-                                logger.info("[Codex] 阶段 2 从 URL 捕获到 auth code!")
-                                break
+                        code = _extract_auth_code_from_callback_url(cur2)
+                        if code:
+                            _set_stage2_auth_code(code, "url")
+                            break
                     except Exception:
                         pass
                     time.sleep(1)
@@ -3260,14 +3420,18 @@ def login_codex_via_browser(
         close_playwright_objects(page, context, browser, logger=logger, label="codex-oauth")
 
     if not auth_code:
-        logger.error("[Codex] OAuth 登录失败: 未获取到 authorization code")
+        error_type, error_detail, retryable = _classify_oauth_failure(
+            last_oauth_failure_url,
+            last_oauth_failure_excerpt,
+        )
+        logger.error("[Codex] OAuth 登录失败: %s", error_detail)
         if return_result:
             return {
                 "ok": False,
                 "bundle": None,
-                "error_type": "auth_code_missing",
-                "error_detail": "未获取到 authorization code",
-                "retryable": True,
+                "error_type": error_type,
+                "error_detail": error_detail,
+                "retryable": retryable,
             }
         return None
 
@@ -4284,7 +4448,7 @@ def _cheap_codex_smoke_network(
             pass
 
 
-def check_codex_quota(access_token, account_id=None):
+def check_codex_quota(access_token, account_id=None, timeout=30):
     """
     通过 /backend-api/wham/usage 查询 Codex 额度状态，不消耗额度。
     返回:
@@ -4296,6 +4460,7 @@ def check_codex_quota(access_token, account_id=None):
     auth_error 与 network_error 必须严格区分:auth_error 会触发"标记 AUTH_INVALID/重登"等
     破坏性流程,网络抖动绝不能落入该分支(否则一次网络故障可能批量误删账号)。
     quota_info = {"primary_pct": int, "primary_resets_at": int, "weekly_pct": int, "weekly_resets_at": int}
+    timeout 用于允许调用方覆盖默认 30s 超时(例如 CPA 实时验证走更短超时)。
     """
     import requests
 
@@ -4313,7 +4478,7 @@ def check_codex_quota(access_token, account_id=None):
         resp = requests.get(
             "https://chatgpt.com/backend-api/wham/usage",
             headers=headers,
-            timeout=30,
+            timeout=timeout,
         )
     except (
         requests.exceptions.ConnectionError,

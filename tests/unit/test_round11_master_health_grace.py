@@ -519,6 +519,43 @@ def test_classify_l1_grace_via_plan_type_fallback_when_grace_until_missing(tmp_p
     assert evidence.get("grace_until") is None
 
 
+def test_classify_l1_usage_based_business_plan_is_active(tmp_path):
+    """eligible=True + self_serve_business_usage_based means an active usage-based Team.
+
+    Regression guard for the live workspace shape: this plan type can expose
+    eligible_for_auto_reactivation=true while the plan is still active.
+    """
+    from autoteam.master_health import is_master_subscription_healthy
+
+    web_jwt = _make_id_token_jwt({
+        "https://api.openai.com/auth": {
+            "chatgpt_plan_type": "self_serve_business_usage_based",
+        },
+    })
+
+    class _StubAPIWithToken(_StubAPI):
+        def __init__(self, items, access_token):
+            super().__init__(items)
+            self.access_token = access_token
+
+    api = _StubAPIWithToken(
+        [
+            {
+                "id": "test-master",
+                "structure": "workspace",
+                "current_user_role": "account-owner",
+                "eligible_for_auto_reactivation": True,
+            },
+        ],
+        access_token=web_jwt,
+    )
+
+    healthy, reason, evidence = is_master_subscription_healthy(api, cache_ttl=0)
+    assert healthy is True
+    assert reason == "active"
+    assert evidence.get("plan_type_jwt") == "self_serve_business_usage_based"
+
+
 def test_classify_l1_cancelled_when_plan_type_free_fallback(tmp_path):
     """eligible=True + JWT 无 grace_until + chatgpt_plan_type=free → 真 cancelled。
 

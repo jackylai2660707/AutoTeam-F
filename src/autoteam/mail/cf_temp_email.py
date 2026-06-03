@@ -131,15 +131,15 @@ class CfTempEmailClient(MailProvider):
 
         domain 优先级:
         1. 显式传入的 domain 参数
-        2. runtime_config.json 的 register_domain
+        2. runtime_config/env 中的注册域名池 round-robin
         3. 环境变量 CLOUDMAIL_DOMAIN
         """
         if domain:
             domain = domain.lstrip("@").strip()
         else:
-            from autoteam.runtime_config import get_register_domain
+            from autoteam.runtime_config import get_next_register_domain
 
-            domain = get_register_domain()
+            domain = get_next_register_domain()
         if not domain:
             raise Exception("创建邮箱失败: 未配置注册域名")
 

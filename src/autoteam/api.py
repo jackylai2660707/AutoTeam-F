@@ -844,6 +844,24 @@ def _rotation_validation_cooldown_remaining() -> float:
     return max(0.0, next_rotate_after - time.time())
 
 
+def _check_account_codex_quota(acc: dict) -> tuple[str, object]:
+    """Check a child auth against its bound workspace account_id."""
+    from autoteam.codex_auth import check_codex_quota
+
+    auth_path = _resolve_status_auth_file(acc)
+    if not auth_path:
+        return "no_auth", None
+    try:
+        auth_data = json.loads(read_text(Path(auth_path)))
+    except Exception:
+        return "no_auth", None
+    access_token = auth_data.get("access_token")
+    if not access_token:
+        return "no_auth", None
+    account_id = auth_data.get("account_id") or None
+    return check_codex_quota(access_token, account_id=account_id)
+
+
 def _log_task_runtime_validation(command: str) -> dict | None:
     """Record post-task runtime truth so completed tasks do not hide broken pool state."""
     if command not in _TASK_VALIDATION_COMMANDS:
@@ -851,7 +869,6 @@ def _log_task_runtime_validation(command: str) -> dict | None:
 
     try:
         from autoteam.accounts import STATUS_ACTIVE, STATUS_AUTH_INVALID, is_account_disabled, load_accounts
-        from autoteam.codex_auth import check_codex_quota
         from autoteam.manager import _pool_active_target
 
         accounts = load_accounts()
@@ -882,12 +899,7 @@ def _log_task_runtime_validation(command: str) -> dict | None:
 
             active_with_auth += 1
             try:
-                auth_data = json.loads(read_text(Path(auth_path)))
-                access_token = auth_data.get("access_token")
-                if not access_token:
-                    quota_unknown += 1
-                    continue
-                quota_status, info = check_codex_quota(access_token)
+                quota_status, info = _check_account_codex_quota(acc)
                 if quota_status == "ok":
                     quota_ok += 1
                 elif quota_status == "exhausted":
@@ -2912,7 +2924,7 @@ def post_account_login(params: LoginAccountParams):
                 update_account(email, status=STATUS_ACTIVE, workspace_account_id=get_chatgpt_account_id() or None)
                 token = bundle.get("access_token")
                 if token:
-                    st, info = check_codex_quota(token)
+                    st, info = check_codex_quota(token, account_id=bundle.get("account_id") or None)
                     if st == "ok" and isinstance(info, dict):
                         update_account(email, last_quota=info)
                     elif st == "exhausted":
@@ -2975,7 +2987,7 @@ def get_status(fast: bool = False):
                 auth_data = json.loads(read_text(Path(auth_file)))
                 access_token = auth_data.get("access_token")
                 if access_token:
-                    status, info = check_codex_quota(access_token)
+                    status, info = check_codex_quota(access_token, account_id=auth_data.get("account_id") or None)
                     if status == "ok" and isinstance(info, dict):
                         quota_cache[acc["email"]] = info
                     elif status == "exhausted":
@@ -3928,7 +3940,6 @@ def _collect_cpa_credential_gate() -> dict:
 def _auto_check_loop():
     """后台巡检线程：定期检查额度，多个账号低于阈值时自动轮转"""
     from autoteam.accounts import STATUS_ACTIVE, is_account_disabled, load_accounts
-    from autoteam.codex_auth import check_codex_quota
 
     while not _auto_check_stop.is_set():
         cfg = _auto_check_config
@@ -3999,6 +4010,35 @@ def _auto_check_loop():
             global _auto_fill_last_trigger_ts
             if len(active) < sub_account_target:
                 now_ts = time.time()
+                try:
+                    from autoteam.config import ROTATE_PAUSE_ON_MASTER_CANCELLED
+                    from autoteam.chatgpt_api import ChatGPTTeamAPI
+                    from autoteam.master_health import is_master_subscription_healthy
+
+                    if ROTATE_PAUSE_ON_MASTER_CANCELLED:
+                        health_api = ChatGPTTeamAPI()
+                        try:
+                            health_api.start()
+                            master_healthy, master_reason, master_evidence = is_master_subscription_healthy(health_api)
+                        finally:
+                            try:
+                                health_api.stop()
+                            except Exception:
+                                pass
+                        if not master_healthy and master_reason == "subscription_cancelled":
+                            _auto_fill_last_trigger_ts = now_ts
+                            logger.error(
+                                "[巡检] master workspace subscription_cancelled，暂停 auto-fill；"
+                                "当前 active=%d/%d team_target=%d account_id=%s",
+                                len(active),
+                                sub_account_target,
+                                target_seats,
+                                (master_evidence or {}).get("account_id"),
+                            )
+                            continue
+                except Exception as exc:
+                    logger.warning("[巡检] master health preflight 异常，按既有 auto-fill 逻辑继续: %s", exc)
+
                 should_start_auto_fill = False
                 cooldown_remaining = (_auto_fill_last_trigger_ts + _AUTO_FILL_COOLDOWN_SECONDS) - now_ts
                 if cooldown_remaining > 0:
@@ -4100,13 +4140,40 @@ def _auto_check_loop():
                                 cpa_credential_gate.get("total"),
                             )
                         else:
-                            logger.info(
-                                "[巡检] 本地 active=%d < %d,但 Team 实际成员数=%d 已满；先跳过 auto-fill,等待同步/对账稳定",
-                                len(active),
-                                sub_account_target,
-                                actual_team_count,
-                            )
-                            continue
+                            try:
+                                from autoteam.manager import _reconcile_team_members
+
+                                recon = _reconcile_team_members()
+                                logger.info(
+                                    "[巡检] Team 已满但本地 active=%d/%d，已执行对账修复: flipped=%d misaligned=%d",
+                                    len(active),
+                                    sub_account_target,
+                                    len((recon or {}).get("flipped_to_active") or []),
+                                    len((recon or {}).get("misaligned_fixed") or []),
+                                )
+                                accounts = load_accounts()
+                                active = [
+                                    a
+                                    for a in accounts
+                                    if a["status"] == STATUS_ACTIVE
+                                    and not _is_main_account_email(a.get("email"))
+                                    and not is_account_disabled(a)
+                                    and a.get("auth_file")
+                                    and Path(a["auth_file"]).exists()
+                                ]
+                                if len(active) >= sub_account_target:
+                                    logger.info("[巡检] 对账后 active=%d/%d 已恢复，继续额度检查", len(active), sub_account_target)
+                                else:
+                                    logger.info(
+                                        "[巡检] 本地 active=%d < %d,但 Team 实际成员数=%d 已满；对账后仍不足，本轮先跳过 auto-fill",
+                                        len(active),
+                                        sub_account_target,
+                                        actual_team_count,
+                                    )
+                                    continue
+                            except Exception as exc:
+                                logger.warning("[巡检] Team 满员本地状态对账失败，本轮先跳过 auto-fill: %s", exc)
+                                continue
                     should_start_auto_fill = True
 
                 if should_start_auto_fill:
@@ -4152,21 +4219,51 @@ def _auto_check_loop():
                 continue
 
             low_accounts = []
+            auth_error_accounts = []
             for acc in active:
                 try:
-                    auth_data = json.loads(read_text(Path(acc["auth_file"])))
-                    access_token = auth_data.get("access_token")
-                    if not access_token:
-                        continue
-                    status, info = check_codex_quota(access_token)
+                    status, info = _check_account_codex_quota(acc)
                     if status == "ok" and isinstance(info, dict):
                         remaining = 100 - info.get("primary_pct", 0)
                         if remaining < cfg["threshold"]:
                             low_accounts.append((acc["email"], remaining))
                     elif status == "exhausted":
                         low_accounts.append((acc["email"], 0))
+                    elif status == "auth_error":
+                        auth_error_accounts.append(acc["email"])
                 except Exception:
                     pass
+
+            if auth_error_accounts:
+                logger.warning(
+                    "[巡检] %d 个 Team 子号 OAuth 失效: %s，触发强制认证修复",
+                    len(auth_error_accounts),
+                    ", ".join(auth_error_accounts[:5]),
+                )
+                if not _playwright_lock.acquire(blocking=False):
+                    logger.info("[巡检] 有任务正在执行，本轮跳过 OAuth 强制修复")
+                    continue
+                _playwright_lock.release()
+
+                from autoteam.manager import cmd_rotate
+
+                try:
+                    _start_task(
+                        "auto-fill",
+                        cmd_rotate,
+                        {
+                            "target_seats": target_seats,
+                            "trigger": "auto-check",
+                            "auth_error_accounts": auth_error_accounts,
+                        },
+                        target_seats,
+                        force_auth_repair=True,
+                        background_post_sync=True,
+                    )
+                    _auto_fill_last_trigger_ts = time.time()
+                except Exception as e:
+                    logger.error("[巡检] OAuth 强制修复启动失败: %s", e)
+                continue
 
             if low_accounts:
                 logger.info(

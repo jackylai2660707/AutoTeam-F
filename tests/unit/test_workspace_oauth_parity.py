@@ -273,6 +273,37 @@ class _FakeSessionPage:
         self.closed += 1
 
 
+class _FakeLoginPage:
+    def __init__(self):
+        self.url = "about:blank"
+        self.goto_urls = []
+        self.closed = 0
+        self.email_input = _FakeElement("")
+        self.password_input = _FakeElement("")
+        self.login_button = _FakeElement("Log in")
+
+    def goto(self, url, wait_until=None, timeout=0):
+        self.url = url
+        self.goto_urls.append(url)
+
+    def locator(self, selector):
+        if selector == "body":
+            return _FakeCollection(text="")
+        if 'input[name="email"]' in selector or 'input[id="email-input"]' in selector or 'input[id="email"]' in selector:
+            return _FakeCollection([self.email_input])
+        if 'input[name="password"]' in selector or 'input[type="password"]' in selector:
+            return _FakeCollection([self.password_input])
+        if 'button:has-text("登录")' in selector or 'button:has-text("Log in")' in selector:
+            return _FakeCollection([self.login_button])
+        return _FakeCollection([])
+
+    def content(self):
+        return ""
+
+    def close(self):
+        self.closed += 1
+
+
 class _FakeContext:
     def __init__(self, page):
         self.page = page
@@ -467,6 +498,7 @@ def test_codex_session_fallback_uses_presigned_cookies(monkeypatch):
     monkeypatch.setattr(codex_auth, "get_chatgpt_account_id", lambda: "account-1")
     monkeypatch.setattr(codex_auth, "get_playwright_launch_options", lambda **_kwargs: {})
     monkeypatch.setattr(codex_auth, "get_playwright_context_options", lambda: {})
+    monkeypatch.setattr(codex_auth, "check_codex_quota", lambda token, account_id=None, timeout=30: ("ok", {}))
 
     token = _fake_jwt(email="tmp@example.com", account_id="account-1", plan_type="team")
     page = _FakeSessionPage([{"accessToken": token}])
@@ -483,3 +515,76 @@ def test_codex_session_fallback_uses_presigned_cookies(monkeypatch):
     assert result["ok"] is True
     assert result["bundle"]["access_token"] == token
     assert page.goto_urls == ["https://chatgpt.com/admin/workspace/account-1"]
+
+
+def test_codex_session_fallback_rejects_cookie_only_team_token(monkeypatch):
+    monkeypatch.setattr(codex_auth.time, "sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        codex_auth,
+        "check_codex_quota",
+        lambda token, account_id=None, timeout=30: ("auth_error", None),
+    )
+
+    token = _fake_jwt(email="tmp@example.com", account_id="account-1", plan_type="team")
+    page = _FakeSessionPage([{"accessToken": token}], quota_status=200)
+    context = _FakeContext(page)
+
+    result = codex_auth._fetch_team_session_bundle_from_context(
+        context,
+        "tmp@example.com",
+        "account-1",
+        stage_label="unit",
+        attempts=1,
+    )
+
+    assert result is None
+    assert page.goto_urls == ["https://chatgpt.com/admin/workspace/account-1"]
+
+
+def test_codex_session_fallback_runs_after_chatgpt_login(monkeypatch):
+    monkeypatch.setattr(codex_auth.time, "sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(codex_auth, "get_chatgpt_account_id", lambda: "account-1")
+    monkeypatch.setattr(codex_auth, "get_playwright_launch_options", lambda **_kwargs: {})
+    monkeypatch.setattr(codex_auth, "get_playwright_context_options", lambda: {})
+    monkeypatch.setattr(codex_auth, "_screenshot", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(codex_auth, "_is_otp_input_visible", lambda *_args, **_kwargs: False)
+
+    page = _FakeLoginPage()
+    monkeypatch.setattr(codex_auth, "sync_playwright", lambda: _FakePlaywright(page))
+
+    def fake_click(_page, field, labels):
+        if field is page.password_input:
+            page.url = "https://chatgpt.com/"
+        return True
+
+    token = _fake_jwt(email="tmp@example.com", account_id="account-1", plan_type="team")
+    seen = {}
+
+    monkeypatch.setattr(codex_auth, "_click_primary_auth_button", fake_click)
+    monkeypatch.setattr(
+        codex_auth,
+        "_resolve_team_session_fallback_bundle",
+        lambda _context, email, account_id, *, stage_label, attempts=3: seen.setdefault(
+            "call",
+            (email, account_id, stage_label, attempts),
+        )
+        and {
+            "access_token": token,
+            "email": email,
+            "account_id": account_id,
+            "plan_type": "team",
+            "plan_supported": True,
+        },
+    )
+
+    result = codex_auth.login_codex_via_browser(
+        "tmp@example.com",
+        "secret",
+        mail_client=None,
+        return_result=True,
+    )
+
+    assert result["ok"] is True
+    assert result["bundle"]["access_token"] == token
+    assert seen["call"] == ("tmp@example.com", "account-1", "post-chatgpt-login", 5)
+    assert page.goto_urls == ["https://chatgpt.com/auth/login"]

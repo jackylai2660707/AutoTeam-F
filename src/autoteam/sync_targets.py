@@ -83,6 +83,13 @@ def get_available_sync_targets(env: Mapping[str, object] | None = None) -> list[
     return available
 
 
+def get_cleanup_sync_targets(env: Mapping[str, object] | None = None) -> list[str]:
+    values = _normalize_env(env)
+    states = get_sync_target_states(values)
+    available = set(get_available_sync_targets(values))
+    return [target for target in _SYNC_TARGET_META if states.get(target, False) and target in available]
+
+
 def get_sync_target_labels(targets: list[str] | None = None) -> list[str]:
     if targets is None:
         targets = list(_SYNC_TARGET_META)
@@ -142,7 +149,7 @@ def sync_to_configured_targets():
 
 def sync_account_to_configured_targets(email: str, filepath: str):
     """只把一个已就绪的账号凭证同步到已启用目标，不触发远端清理。"""
-    from autoteam.accounts import STATUS_ACTIVE, find_account, is_account_disabled, load_accounts
+    from autoteam.accounts import STATUS_ACTIVE, _is_main_account_email, find_account, is_account_disabled, load_accounts
 
     normalized_email = (email or "").strip().lower()
     auth_path = Path(filepath)
@@ -159,6 +166,9 @@ def sync_account_to_configured_targets(email: str, filepath: str):
     if is_account_disabled(account):
         logger.info("[Sync] 账号已禁用，跳过新凭证即时同步: %s", normalized_email)
         return {"ok": False, "skipped": True, "reason": "account_disabled", "auth_file": auth_path.name}
+    if _is_main_account_email(normalized_email):
+        logger.info("[Sync] 主号不参与子号远端同步，跳过即时同步: %s", normalized_email)
+        return {"ok": False, "skipped": True, "reason": "main_account_excluded", "auth_file": auth_path.name}
     if account.get("status") != STATUS_ACTIVE:
         logger.info(
             "[Sync] 账号尚未 active，跳过新凭证即时同步: %s (status=%s)",
@@ -236,7 +246,7 @@ def sync_main_codex_to_configured_targets(filepath: str):
 
 def delete_main_codex_from_configured_targets(*, include_disabled: bool = False):
     results = {}
-    targets = get_available_sync_targets() if include_disabled else get_enabled_sync_targets()
+    targets = get_cleanup_sync_targets() if include_disabled else get_enabled_sync_targets()
 
     if SYNC_TARGET_CPA in targets:
         from autoteam.cpa_sync import delete_main_codex_from_cpa
@@ -255,7 +265,7 @@ def delete_account_from_configured_targets(
     email: str, *, auth_names: list[str] | None = None, include_disabled: bool = False
 ):
     results = {}
-    targets = get_available_sync_targets() if include_disabled else get_enabled_sync_targets()
+    targets = get_cleanup_sync_targets() if include_disabled else get_enabled_sync_targets()
 
     if SYNC_TARGET_CPA in targets:
         from autoteam.cpa_sync import delete_from_cpa, list_cpa_files

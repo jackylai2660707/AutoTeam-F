@@ -59,7 +59,7 @@ class TestReuseOneStandby:
             chatgpt_provider=lambda: None,
             mail_provider=lambda acc: None,
             reinvite_fn=lambda *a, **kw: True,
-            quota_fn=lambda token: ("ok", {"primary_pct": 0}),
+            quota_fn=lambda token, **_kwargs: ("ok", {"primary_pct": 0}),
             now=1000.0,
         )
         assert result == {"email": "a@x.com", "result": "skipped_auto", "error": None}
@@ -75,7 +75,7 @@ class TestReuseOneStandby:
             chatgpt_provider=lambda: "FAKE_CHATGPT",
             mail_provider=lambda acc: "FAKE_MAIL",
             reinvite_fn=reinvite,
-            quota_fn=lambda token: ("ok", {"primary_pct": 5}),  # 95% remain >> 10%
+            quota_fn=lambda token, **_kwargs: ("ok", {"primary_pct": 5}),  # 95% remain >> 10%
             now=1000.0,
         )
         assert result == {"email": "a@x.com", "result": "reused", "error": None}
@@ -91,7 +91,7 @@ class TestReuseOneStandby:
             chatgpt_provider=lambda: None,
             mail_provider=lambda acc: None,
             reinvite_fn=lambda *a, **kw: False,
-            quota_fn=lambda token: ("ok", {"primary_pct": 5}),
+            quota_fn=lambda token, **_kwargs: ("ok", {"primary_pct": 5}),
             now=1000.0,
         )
         assert result["result"] == "failed"
@@ -109,7 +109,7 @@ class TestReuseOneStandby:
             chatgpt_provider=lambda: None,
             mail_provider=lambda acc: None,
             reinvite_fn=bad_reinvite,
-            quota_fn=lambda token: ("ok", {"primary_pct": 5}),
+            quota_fn=lambda token, **_kwargs: ("ok", {"primary_pct": 5}),
             now=1000.0,
         )
         # acc has no last_quota or quota_resets_at → quota_ok loop passes through →
@@ -129,10 +129,31 @@ class TestReuseOneStandby:
             chatgpt_provider=lambda: None,
             mail_provider=lambda acc: None,
             reinvite_fn=lambda *a, **kw: True,
-            quota_fn=lambda token: ("exhausted", {"window": "5h", "primary_pct": 100}),
+            quota_fn=lambda token, **_kwargs: ("exhausted", {"window": "5h", "primary_pct": 100}),
             now=1000.0,
         )
         assert result["result"] == "skipped_quota"
+
+    def test_auth_error_uses_historical_quota_and_still_reinvites(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(manager_mod, "_auto_reuse_skip_reason", lambda acc: None)
+        auth_path = tmp_path / "auth.json"
+        auth_path.write_text('{"access_token":"X"}')
+        reinvite = MagicMock(return_value=True)
+        result = _reuse_one_standby(
+            {
+                "email": "a@x.com",
+                "auth_file": str(auth_path),
+                "last_quota": {"primary_pct": 1, "primary_resets_at": 9999999999},
+            },
+            threshold=10,
+            chatgpt_provider=lambda: "FAKE_CHATGPT",
+            mail_provider=lambda acc: "FAKE_MAIL",
+            reinvite_fn=reinvite,
+            quota_fn=lambda token, **_kwargs: ("auth_error", None),
+            now=1000.0,
+        )
+        assert result == {"email": "a@x.com", "result": "reused", "error": None}
+        reinvite.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

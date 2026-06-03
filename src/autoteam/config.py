@@ -1,6 +1,7 @@
 """配置文件 - 从 .env 文件或环境变量加载"""
 
 import os
+import re
 from pathlib import Path
 from urllib.parse import quote, unquote, urlsplit
 
@@ -32,6 +33,11 @@ def _get_str_env(name: str, default: str = "") -> str:
     return str(value).strip()
 
 
+def _split_env_list(value: str | None) -> tuple[str, ...]:
+    raw = parse_env_value(str(value or ""))
+    return tuple(item.strip() for item in re.split(r"[\s,;]+", raw) if item.strip())
+
+
 def _normalize_chatgpt_api_transport(value: str) -> str:
     mode = str(value or "").strip().lower()
     if mode in {"auto", "playwright", "curl_cffi"}:
@@ -58,6 +64,7 @@ CLOUDMAIL_BASE_URL = os.environ.get("CLOUDMAIL_BASE_URL", "")
 CLOUDMAIL_EMAIL = os.environ.get("CLOUDMAIL_EMAIL", "")
 CLOUDMAIL_PASSWORD = os.environ.get("CLOUDMAIL_PASSWORD", "")
 CLOUDMAIL_DOMAIN = os.environ.get("CLOUDMAIL_DOMAIN", "")
+CLOUDMAIL_DOMAINS = _split_env_list(os.environ.get("CLOUDMAIL_DOMAINS", ""))
 
 # ChatGPT Team 配置
 CHATGPT_ACCOUNT_ID = os.environ.get("CHATGPT_ACCOUNT_ID", "")
@@ -115,9 +122,11 @@ AUTO_CHECK_ADD_PHONE_MAX_RETRIES = _get_int_env("AUTO_CHECK_ADD_PHONE_MAX_RETRIE
 
 # 默认不复用旧/失败/退役子号。Team 满员需要替换时必须先移出旧 child，再创建新 child。
 ROTATE_SKIP_REUSE = _get_bool_env("ROTATE_SKIP_REUSE", True)
+ROTATE_REUSE_CANDIDATE_LIMIT = max(1, min(32, _get_int_env("ROTATE_REUSE_CANDIDATE_LIMIT", 8)))
 ROTATE_NEW_ACCOUNT_MODE = _normalize_rotate_new_account_mode(
     _get_str_env("ROTATE_NEW_ACCOUNT_MODE", "domain_auto_join_first")
 )
+ROTATE_PAUSE_ON_MASTER_CANCELLED = _get_bool_env("ROTATE_PAUSE_ON_MASTER_CANCELLED", True)
 AUTOTEAM_AUTO_JOIN_DOMAINS = _get_str_env("AUTOTEAM_AUTO_JOIN_DOMAINS", "auto")
 ROTATE_DOMAIN_AUTO_JOIN_FALLBACK_INVITE = _get_bool_env("ROTATE_DOMAIN_AUTO_JOIN_FALLBACK_INVITE", True)
 ROTATE_MAX_DURATION = max(60, _get_int_env("ROTATE_MAX_DURATION", 1500))
@@ -158,6 +167,7 @@ RECONCILE_KICK_GHOST = _get_bool_env("RECONCILE_KICK_GHOST", True)
 
 # Playwright 代理配置
 PLAYWRIGHT_PROXY_URL = os.environ.get("PLAYWRIGHT_PROXY_URL", "").strip()
+PLAYWRIGHT_PROXY_URLS = _split_env_list(os.environ.get("PLAYWRIGHT_PROXY_URLS", ""))
 PLAYWRIGHT_PROXY_SERVER = os.environ.get("PLAYWRIGHT_PROXY_SERVER", "").strip()
 PLAYWRIGHT_PROXY_USERNAME = os.environ.get("PLAYWRIGHT_PROXY_USERNAME", "").strip()
 PLAYWRIGHT_PROXY_PASSWORD = os.environ.get("PLAYWRIGHT_PROXY_PASSWORD", "").strip()

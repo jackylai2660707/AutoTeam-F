@@ -34,16 +34,14 @@ def test_reinvite_account_uses_unified_oauth_login_and_marks_active(monkeypatch)
         "check_codex_quota",
         lambda token: ("ok", {"primary_pct": 0, "weekly_pct": 0, "primary_total": 1000}),
     )
+    monkeypatch.setattr(manager, "invite_to_team", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(manager, "_wait_email_in_team", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(manager, "get_chatgpt_account_id", lambda: "wsk-1")
     monkeypatch.setattr(manager.time, "time", lambda: 1234567890)
-    monkeypatch.setattr(
-        manager,
-        "_is_email_in_team",
-        lambda email: (_ for _ in ()).throw(AssertionError("should not check team membership separately")),
-    )
+    monkeypatch.setattr(manager, "_is_email_in_team", lambda email: False)
 
     result = manager.reinvite_account(
-        types.SimpleNamespace(browser=False),
+        types.SimpleNamespace(browser=False, start=lambda: None, stop=lambda: None),
         None,
         {"email": "tmp-user@example.com", "password": "secret"},
     )
@@ -94,8 +92,11 @@ def test_reinvite_account_stops_http_transport_session_before_oauth(monkeypatch)
     monkeypatch.setattr(manager, "save_auth_file", lambda bundle: f"/tmp/{bundle['email']}.json")
     monkeypatch.setattr(manager, "update_account", lambda email, **kwargs: updates.append((email, kwargs)))
     monkeypatch.setattr(manager, "check_codex_quota", lambda token: ("ok", {"primary_pct": 0}))
+    monkeypatch.setattr(manager, "invite_to_team", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(manager, "_wait_email_in_team", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(manager, "get_chatgpt_account_id", lambda: "wsk-1")
     monkeypatch.setattr(manager.time, "time", lambda: 1234567890)
+    monkeypatch.setattr(manager, "_is_email_in_team", lambda email: False)
 
     result = manager.reinvite_account(
         api,
@@ -131,14 +132,12 @@ def test_reinvite_account_marks_auth_invalid_when_oauth_login_returns_non_team(m
         "update_account",
         lambda email, **kwargs: updates.append((email, kwargs)),
     )
-    monkeypatch.setattr(
-        manager,
-        "_is_email_in_team",
-        lambda email: (_ for _ in ()).throw(AssertionError("should not check team membership separately")),
-    )
+    monkeypatch.setattr(manager, "invite_to_team", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(manager, "_wait_email_in_team", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(manager, "_is_email_in_team", lambda email: False)
 
     result = manager.reinvite_account(
-        types.SimpleNamespace(browser=False),
+        types.SimpleNamespace(browser=False, start=lambda: None, stop=lambda: None),
         None,
         {"email": "tmp-user@example.com", "password": ""},
     )
@@ -155,3 +154,28 @@ def test_reinvite_account_marks_auth_invalid_when_oauth_login_returns_non_team(m
     assert auth_invalid_updates[0] == (
         "tmp-user@example.com", {"status": accounts.STATUS_AUTH_INVALID, "auth_file": None}
     )
+
+
+def test_reinvite_account_requires_remote_team_confirmation_before_oauth(monkeypatch):
+    login_called = {"value": False}
+    updates = []
+
+    def fake_login(*_args, **_kwargs):
+        login_called["value"] = True
+        return None
+
+    monkeypatch.setattr(manager, "login_codex_via_browser", fake_login)
+    monkeypatch.setattr(manager, "invite_to_team", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(manager, "_is_email_in_team", lambda email: False)
+    monkeypatch.setattr(manager, "_wait_email_in_team", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(manager, "update_account", lambda email, **kwargs: updates.append((email, kwargs)))
+
+    result = manager.reinvite_account(
+        types.SimpleNamespace(browser=False, start=lambda: None, stop=lambda: None),
+        None,
+        {"email": "tmp-user@example.com", "password": "secret"},
+    )
+
+    assert result is False
+    assert login_called["value"] is False
+    assert ("tmp-user@example.com", {"status": accounts.STATUS_STANDBY}) in updates

@@ -32,6 +32,20 @@ def test_get_sync_target_states_respects_explicit_toggle_override():
     }
 
 
+def test_get_cleanup_sync_targets_respects_explicit_false_toggle():
+    env = {
+        "SYNC_TARGET_CPA": "true",
+        "CPA_URL": "http://127.0.0.1:8317",
+        "CPA_KEY": "key-1",
+        "SYNC_TARGET_SUB2API": "false",
+        "SUB2API_URL": "http://127.0.0.1:8080",
+        "SUB2API_EMAIL": "admin@example.com",
+        "SUB2API_PASSWORD": "secret",
+    }
+
+    assert sync_targets.get_cleanup_sync_targets(env) == ["cpa"]
+
+
 def test_describe_sync_targets_formats_labels():
     assert sync_targets.describe_sync_targets(["cpa"]) == "CPA"
     assert sync_targets.describe_sync_targets(["cpa", "sub2api"]) == "CPA + Sub2API"
@@ -108,3 +122,35 @@ def test_sync_account_to_configured_targets_skips_non_active_auth(monkeypatch, t
     assert result["ok"] is False
     assert result["skipped"] is True
     assert result["reason"] == "account_not_active"
+
+
+def test_sync_account_to_configured_targets_skips_main_account(monkeypatch, tmp_path):
+    auth_file = tmp_path / "codex-main@example.com-free-a.json"
+    auth_file.write_text('{"access_token":"token"}', encoding="utf-8")
+
+    monkeypatch.setattr(
+        "autoteam.accounts.load_accounts",
+        lambda: [{"email": "main@example.com", "status": "active", "auth_file": str(auth_file), "disabled": False}],
+    )
+    monkeypatch.setattr("autoteam.accounts._is_main_account_email", lambda email: email == "main@example.com")
+    monkeypatch.setattr(
+        sync_targets,
+        "get_enabled_sync_targets",
+        lambda: [sync_targets.SYNC_TARGET_CPA, sync_targets.SYNC_TARGET_SUB2API],
+    )
+    monkeypatch.setattr(
+        "autoteam.cpa_sync.upload_to_cpa",
+        lambda _path: (_ for _ in ()).throw(AssertionError("main account must not upload to CPA")),
+    )
+    monkeypatch.setattr(
+        "autoteam.sub2api_sync.sync_account_to_sub2api",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("main account must not upload to Sub2API")
+        ),
+    )
+
+    result = sync_targets.sync_account_to_configured_targets("main@example.com", str(auth_file))
+
+    assert result["ok"] is False
+    assert result["skipped"] is True
+    assert result["reason"] == "main_account_excluded"
