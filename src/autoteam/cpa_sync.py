@@ -699,6 +699,7 @@ def sync_to_cpa():
     - 主号(admin/owner)永远不参与子号 CPA 同步，避免把 invite/admin 凭证误发到远端
     """
     from autoteam.accounts import (
+        SEAT_CODEX,
         STATUS_ACTIVE,
         STATUS_PERSONAL,
         _is_main_account_email,
@@ -738,6 +739,8 @@ def sync_to_cpa():
     active_publish_skipped = 0
     active_publish_kept_remote = 0
     active_publish_delete_remote = 0
+    codex_excluded_remote_delete = 0
+    codex_excluded_emails = set()
     keep_remote_names = set()
     for acc in accounts:
         if is_account_disabled(acc):
@@ -745,8 +748,14 @@ def sync_to_cpa():
             continue
         if _is_main_account_email(acc.get("email")):
             continue
+        email = str(acc.get("email") or "").strip().lower()
+        if email and str(acc.get("seat_type") or "").strip().lower() == SEAT_CODEX:
+            codex_excluded_emails.add(email)
         status = acc.get("status")
         if status not in (STATUS_ACTIVE, STATUS_PERSONAL):
+            continue
+        if status == STATUS_ACTIVE and str(acc.get("seat_type") or "").strip().lower() == SEAT_CODEX:
+            logger.info("[CPA] 跳过 codex-only active 凭证并标记远端清理: %s", acc.get("email"))
             continue
         auth_path = acc.get("auth_file")
         if not auth_path:
@@ -812,6 +821,12 @@ def sync_to_cpa():
                 logger.info("[CPA] 保留当前 active 远端副本（实时验证网络异常）: %s (%s)", name, email)
                 skipped_remote_delete += 1
                 continue
+            if email in codex_excluded_emails:
+                logger.info("[CPA] 删除 codex-only 席位远端凭证: %s (%s)", name, email)
+                if delete_from_cpa(name):
+                    deleted += 1
+                    codex_excluded_remote_delete += 1
+                continue
             if not allow_remote_delete:
                 logger.warning(
                     "[CPA] active 凭证不足，保留远端本地管理文件，避免故障期清空 Team OAuth: %s (%s)",
@@ -852,6 +867,7 @@ def sync_to_cpa():
             "skipped_unknown": active_publish_skipped,
             "kept_remote": active_publish_kept_remote,
             "delete_remote": active_publish_delete_remote,
+            "codex_excluded_remote_delete": codex_excluded_remote_delete,
         },
         "local_duplicates_deleted": local_duplicates_deleted,
         "delete_guard": {

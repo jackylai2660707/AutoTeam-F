@@ -149,7 +149,14 @@ def sync_to_configured_targets():
 
 def sync_account_to_configured_targets(email: str, filepath: str):
     """只把一个已就绪的账号凭证同步到已启用目标，不触发远端清理。"""
-    from autoteam.accounts import STATUS_ACTIVE, _is_main_account_email, find_account, is_account_disabled, load_accounts
+    from autoteam.accounts import (
+        SEAT_CODEX,
+        STATUS_ACTIVE,
+        _is_main_account_email,
+        find_account,
+        is_account_disabled,
+        load_accounts,
+    )
 
     normalized_email = (email or "").strip().lower()
     auth_path = Path(filepath)
@@ -180,6 +187,14 @@ def sync_account_to_configured_targets(email: str, filepath: str):
             "skipped": True,
             "reason": "account_not_active",
             "status": account.get("status"),
+            "auth_file": auth_path.name,
+        }
+    if str(account.get("seat_type") or "").strip().lower() == SEAT_CODEX:
+        logger.info("[Sync] codex-only 席位不发布到远端 CPA/Sub2API: %s", normalized_email)
+        return {
+            "ok": False,
+            "skipped": True,
+            "reason": "codex_seat_excluded",
             "auth_file": auth_path.name,
         }
 

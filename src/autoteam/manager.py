@@ -35,11 +35,15 @@ from autoteam.account_ops import (
     delete_team_invite,
     fetch_team_state,
     team_invite_email,
+    team_member_account_user_id,
     team_member_email,
+    team_member_seat_type,
+    team_member_user_id,
 )
 from autoteam.accounts import (
     SEAT_CHATGPT,
     SEAT_CODEX,
+    SEAT_UNKNOWN,
     STATUS_ACTIVE,
     STATUS_AUTH_INVALID,
     STATUS_AUTH_PENDING,
@@ -763,11 +767,13 @@ def _abandon_account_after_add_phone(email: str, *, detail: str | None = None) -
 
 
 def _retire_team_auth_after_team_exit(email: str, *, reason: str = "team_exit") -> list[str]:
-    """Retire stale Team auth after an account leaves Team.
+    """Retire a Team auth that must no longer be published.
 
-    A Team OAuth token becomes invalid once the child leaves the workspace. Keep a
-    small local backup for forensics, but remove the live auth_file reference and
-    delete matching remote credentials so CPA/Sub2API do not accumulate dead auths.
+    A Team OAuth token becomes invalid once the child leaves the workspace. In
+    seat-swap mode, a codex-only (`usage_based`) member can still be in Team, but
+    its auth must not be published to CPA because CPA should only receive full
+    ChatGPT-seat credentials. Keep a small local backup for forensics, remove the
+    live auth_file reference, and delete matching remote credentials.
     """
     email = _normalized_email(email)
     if not email or _is_main_account_email(email):
@@ -804,9 +810,9 @@ def _retire_team_auth_after_team_exit(email: str, *, reason: str = "team_exit") 
             shutil.move(str(path), str(backup_path))
             retired_names.append(path.name)
             backup_paths.append(str(backup_path))
-            logger.info("[Auth] 已退役离队 Team auth: %s -> %s", path.name, backup_path)
+            logger.info("[Auth] 已退役 Team auth: %s -> %s (reason=%s)", path.name, backup_path, reason)
         except Exception as exc:
-            logger.warning("[Auth] 退役离队 Team auth 失败: %s (%s)", path, exc)
+            logger.warning("[Auth] 退役 Team auth 失败: %s (%s)", path, exc)
 
     update_account(
         email,
@@ -829,6 +835,145 @@ def _mark_standby_after_team_exit(email: str, *, reason: str) -> None:
     """Mark an account standby and retire its stale Team auth in one place."""
     update_account(email, status=STATUS_STANDBY, _reason=reason)
     _retire_team_auth_after_team_exit(email, reason=reason)
+
+
+def _seat_swap_enabled() -> bool:
+    try:
+        from autoteam.config import ROTATE_SEAT_SWAP_ENABLED
+
+        return bool(ROTATE_SEAT_SWAP_ENABLED)
+    except Exception:
+        return False
+
+
+def _seat_swap_fallback_kick_enabled() -> bool:
+    try:
+        from autoteam.config import ROTATE_SEAT_SWAP_FALLBACK_KICK
+
+        return bool(ROTATE_SEAT_SWAP_FALLBACK_KICK)
+    except Exception:
+        return True
+
+
+def _remote_seat_type_for_local(seat_type: str | None) -> str:
+    normalized = str(seat_type or "").strip().lower()
+    if normalized in {SEAT_CODEX, "usage_based"}:
+        return "usage_based"
+    return "default"
+
+
+def _local_seat_type_from_remote(seat_type: str | None) -> str:
+    normalized = str(seat_type or "").strip().lower()
+    if normalized == "usage_based":
+        return SEAT_CODEX
+    if normalized == "default":
+        return SEAT_CHATGPT
+    return SEAT_UNKNOWN
+
+
+def _fetch_team_member_by_email(chatgpt_api, email: str | None) -> dict | None:
+    email_l = _normalized_email(email)
+    if not email_l:
+        return None
+    account_id = get_chatgpt_account_id()
+    if not account_id:
+        return None
+    result = chatgpt_api._api_fetch("GET", f"/backend-api/accounts/{account_id}/users")
+    if result.get("status") != 200:
+        logger.warning("[SeatSwap] 获取 Team users 失败: HTTP %s %s", result.get("status"), (result.get("body") or "")[:160])
+        return None
+    try:
+        data = json.loads(result.get("body") or "{}")
+    except Exception as exc:
+        logger.warning("[SeatSwap] 解析 Team users 失败: %s", exc)
+        return None
+    members = data.get("items", data.get("users", data.get("members", [])))
+    for member in members:
+        if team_member_email(member) == email_l:
+            return member
+    return None
+
+
+def _update_team_member_seat_type(chatgpt_api, email: str, seat_type: str, *, member: dict | None = None) -> bool:
+    """PATCH a Team member seat type (`default` or `usage_based`)."""
+    account_id = get_chatgpt_account_id()
+    if not account_id:
+        logger.warning("[SeatSwap] account_id 为空,无法修改 seat_type: %s", email)
+        return False
+    if not _chatgpt_session_ready(chatgpt_api):
+        chatgpt_api.start()
+
+    target_remote = _remote_seat_type_for_local(seat_type)
+    member = member or _fetch_team_member_by_email(chatgpt_api, email)
+    if not member:
+        logger.warning("[SeatSwap] 找不到 Team member,无法修改 seat_type: %s", email)
+        return False
+
+    current_remote = team_member_seat_type(member)
+    if current_remote == target_remote:
+        logger.info("[SeatSwap] %s seat_type 已经是 %s", email, target_remote)
+        return True
+
+    ids = []
+    for value in (team_member_user_id(member), team_member_account_user_id(member)):
+        if value and value not in ids:
+            ids.append(value)
+
+    for member_id in ids:
+        path = f"/backend-api/accounts/{account_id}/users/{member_id}"
+        result = chatgpt_api._api_fetch("PATCH", path, {"seat_type": target_remote})
+        if result.get("status") in (200, 204):
+            logger.info("[SeatSwap] %s seat_type %s -> %s", email, current_remote or "unknown", target_remote)
+            return True
+        logger.warning(
+            "[SeatSwap] PATCH %s seat_type=%s 失败: HTTP %s %s",
+            member_id,
+            target_remote,
+            result.get("status"),
+            (result.get("body") or "")[:200],
+        )
+    return False
+
+
+def _mark_codex_standby_after_seat_downgrade(email: str, *, reason: str, quota_resets_at=None) -> None:
+    now_ts = time.time()
+    update_account(
+        email,
+        status=STATUS_STANDBY,
+        seat_type=SEAT_CODEX,
+        auth_file=None,
+        quota_exhausted_at=now_ts,
+        quota_resets_at=quota_resets_at or now_ts + 18000,
+        _reason=reason,
+    )
+    _retire_team_auth_after_team_exit(email, reason=reason)
+
+
+def _downgrade_team_member_to_codex_standby(chatgpt_api, acc: dict, *, reason: str) -> bool:
+    email = acc.get("email")
+    if not email or _is_main_account_email(email):
+        return False
+    if not _chatgpt_session_ready(chatgpt_api):
+        chatgpt_api.start()
+    ok = _update_team_member_seat_type(chatgpt_api, email, SEAT_CODEX)
+    if not ok:
+        return False
+    quota_info = acc.get("last_quota") or {}
+    quota_resets_at = quota_info.get("primary_resets_at") or acc.get("quota_resets_at")
+    _mark_codex_standby_after_seat_downgrade(email, reason=reason, quota_resets_at=quota_resets_at)
+    logger.info("[SeatSwap] %s 已降为 codex standby,保留 Team 成员但移除 CPA OAuth", email)
+    return True
+
+
+def _promote_team_member_to_chatgpt_seat(chatgpt_api, email: str) -> bool:
+    if not email or _is_main_account_email(email):
+        return False
+    if not _chatgpt_session_ready(chatgpt_api):
+        chatgpt_api.start()
+    ok = _update_team_member_seat_type(chatgpt_api, email, SEAT_CHATGPT)
+    if ok:
+        update_account(email, seat_type=SEAT_CHATGPT, _reason="seat_swap:promote_chatgpt")
+    return ok
 
 
 def _attach_account_proxy_to_bundle(email: str | None, bundle: dict | None, proxy_url: str | None = None) -> None:
@@ -898,6 +1043,8 @@ def _is_pool_active_account_usable(acc: dict | None, *, require_auth: bool = Tru
     if _is_main_account_email(acc.get("email")) or is_account_disabled(acc):
         return False
     if acc.get("status") != STATUS_ACTIVE:
+        return False
+    if str(acc.get("seat_type") or "").strip().lower() == SEAT_CODEX:
         return False
     if require_auth and not _has_auth_file(acc):
         return False
@@ -1649,11 +1796,49 @@ def _reconcile_team_members(chatgpt_api=None, *, dry_run=False):
                 continue
 
             status = acc.get("status")
+            remote_seat = _local_seat_type_from_remote(team_member_seat_type(_m))
+
+            if remote_seat == SEAT_CODEX:
+                if status == STATUS_STANDBY:
+                    if acc.get("seat_type") != SEAT_CODEX or acc.get("auth_file"):
+                        logger.info("[对账] %s 为 codex standby 席,保持 standby 并清理 CPA OAuth", email)
+                        _safe_update(
+                            acc.get("email"),
+                            status=STATUS_STANDBY,
+                            seat_type=SEAT_CODEX,
+                            auth_file=None,
+                            workspace_account_id=account_id,
+                            remote_seen_at=time.time(),
+                            _reason="reconcile:codex_standby",
+                        )
+                        if not dry_run:
+                            _retire_team_auth_after_team_exit(email, reason="reconcile:codex_standby")
+                    continue
+                if status == STATUS_ACTIVE:
+                    logger.warning("[对账] %s remote=codex 但本地 active,降为 standby 并清理 CPA OAuth", email)
+                    _safe_update(
+                        acc.get("email"),
+                        status=STATUS_STANDBY,
+                        seat_type=SEAT_CODEX,
+                        auth_file=None,
+                        workspace_account_id=account_id,
+                        remote_seen_at=time.time(),
+                        _reason="reconcile:active_remote_codex",
+                    )
+                    if not dry_run:
+                        _retire_team_auth_after_team_exit(email, reason="reconcile:active_remote_codex")
+                    result["misaligned_fixed"].append(email)
+                    continue
 
             if status == STATUS_PENDING:
                 logger.info("[对账] %s pending → active(Team 里已存在)", email)
                 # 同步当前 workspace 指纹,防止下轮 sync_account_states 把它误打 standby
-                _safe_update(acc.get("email"), status=STATUS_ACTIVE, workspace_account_id=account_id)
+                _safe_update(
+                    acc.get("email"),
+                    status=STATUS_ACTIVE,
+                    seat_type=SEAT_CHATGPT if remote_seat == SEAT_CHATGPT else acc.get("seat_type") or SEAT_UNKNOWN,
+                    workspace_account_id=account_id,
+                )
                 result["flipped_to_active"].append(email)
                 continue
 
@@ -1668,6 +1853,7 @@ def _reconcile_team_members(chatgpt_api=None, *, dry_run=False):
                         _safe_update(
                             acc.get("email"),
                             status=STATUS_ACTIVE,
+                            seat_type=SEAT_CHATGPT if remote_seat == SEAT_CHATGPT else acc.get("seat_type") or SEAT_UNKNOWN,
                             auth_file=found,
                             workspace_account_id=account_id,
                         )
@@ -1688,7 +1874,12 @@ def _reconcile_team_members(chatgpt_api=None, *, dry_run=False):
                             _safe_update(acc.get("email"), status=STATUS_ORPHAN)
                             result["orphan_marked"].append(email)
                 else:
-                    _safe_update(acc.get("email"), status=STATUS_ACTIVE, workspace_account_id=account_id)
+                    _safe_update(
+                        acc.get("email"),
+                        status=STATUS_ACTIVE,
+                        seat_type=SEAT_CHATGPT if remote_seat == SEAT_CHATGPT else acc.get("seat_type") or SEAT_UNKNOWN,
+                        workspace_account_id=account_id,
+                    )
                     result["misaligned_fixed"].append(email)
                     _check_and_mark_exhausted(acc, email, _safe_update, result)
                 continue
@@ -1732,6 +1923,8 @@ def _reconcile_team_members(chatgpt_api=None, *, dry_run=False):
                     continue
 
                 # 正常 active
+                if remote_seat == SEAT_CHATGPT and acc.get("seat_type") != SEAT_CHATGPT:
+                    _safe_update(acc.get("email"), seat_type=SEAT_CHATGPT, remote_seen_at=time.time())
                 continue
 
             if status == STATUS_ORPHAN:
@@ -1912,7 +2105,8 @@ def sync_account_states(chatgpt_api=None):
 
         data = json.loads(result["body"])
         members = data.get("items", data.get("users", data.get("members", [])))
-        team_emails = {m.get("email", "").lower() for m in members}
+        member_by_email = {team_member_email(m): m for m in members if team_member_email(m)}
+        team_emails = set(member_by_email)
     finally:
         if need_stop:
             chatgpt_api.stop()
@@ -1956,6 +2150,25 @@ def sync_account_states(chatgpt_api=None):
     for acc in accounts:
         email = acc["email"].lower()
         in_team = email in team_emails
+        remote_member = member_by_email.get(email) if in_team else None
+        remote_seat = _local_seat_type_from_remote(team_member_seat_type(remote_member)) if remote_member else SEAT_UNKNOWN
+
+        if in_team and remote_seat == SEAT_CODEX:
+            if acc.get("status") != STATUS_STANDBY or acc.get("seat_type") != SEAT_CODEX or acc.get("auth_file"):
+                _transition_status(
+                    acc["email"],
+                    STATUS_STANDBY,
+                    seat_type=SEAT_CODEX,
+                    remote_seen_at=now_ts,
+                    auth_file=None,
+                    _reason="sync_account_states:codex_seat_standby",
+                )
+                _retire_team_auth_after_team_exit(acc["email"], reason="sync_account_states:codex_seat_standby")
+                acc["status"] = STATUS_STANDBY
+                acc["seat_type"] = SEAT_CODEX
+                acc["auth_file"] = None
+                changed = True
+            continue
 
         if in_team and acc["status"] in (STATUS_STANDBY, STATUS_PENDING, "auth_pending"):
             # Round 12 wire-up M1 — go through state machine (default_machine.transition).
@@ -1963,6 +2176,7 @@ def sync_account_states(chatgpt_api=None):
             protect_team_seat = _has_auth_file(acc)
             _transition_status(
                 acc["email"], STATUS_ACTIVE,
+                seat_type=SEAT_CHATGPT if remote_seat == SEAT_CHATGPT else acc.get("seat_type") or SEAT_UNKNOWN,
                 workspace_account_id=ws_id,
                 protect_team_seat=protect_team_seat,
                 remote_seen_at=now_ts,
@@ -1971,11 +2185,24 @@ def sync_account_states(chatgpt_api=None):
             # 内存里也同步,后续 need_probe / domain_suffix 分支基于刷新后的状态判断
             acc["status"] = STATUS_ACTIVE
             acc["remote_seen_at"] = now_ts
+            if remote_seat == SEAT_CHATGPT:
+                acc["seat_type"] = SEAT_CHATGPT
             if protect_team_seat:
                 acc["protect_team_seat"] = True
             if account_id:
                 acc["workspace_account_id"] = account_id
             changed = True
+        elif in_team and acc["status"] == STATUS_ACTIVE and remote_seat == SEAT_CHATGPT:
+            if acc.get("seat_type") != SEAT_CHATGPT:
+                _transition_status(
+                    acc["email"],
+                    STATUS_ACTIVE,
+                    seat_type=SEAT_CHATGPT,
+                    remote_seen_at=now_ts,
+                    _reason="sync_account_states:chatgpt_seat_active",
+                )
+                acc["seat_type"] = SEAT_CHATGPT
+                changed = True
         elif not in_team and acc["status"] == STATUS_ACTIVE:
             # 守卫(Bug 4A):账号记录的 workspace_account_id 与当前 workspace 不一致 →
             # 这是母号切换造成的"前母号留下号",不是真的被踢出。保留原 active,
@@ -6080,6 +6307,22 @@ def reinvite_account(chatgpt_api, mail_client, acc):
 
     def _cleanup_team_leftover(reason):
         """OAuth 失败/plan 不对时,兜底 kick 账号,避免假 standby。"""
+        if _seat_swap_enabled():
+            try:
+                if not _chatgpt_session_ready(chatgpt_api):
+                    chatgpt_api.start()
+                if _downgrade_team_member_to_codex_standby(
+                    chatgpt_api,
+                    {"email": email, **(find_account(load_accounts(), email) or {})},
+                    reason=f"seat_swap:reinvite_failed:{reason}",
+                ):
+                    logger.info("[轮转] OAuth 失败(%s),已降回 codex standby: %s", reason, email)
+                    return "downgraded"
+            except Exception as exc:
+                logger.warning("[轮转] OAuth 失败后降级 codex %s 抛异常: %s", email, exc)
+            if not _seat_swap_fallback_kick_enabled():
+                return "downgrade_failed"
+
         kick_status = None
         try:
             if not _chatgpt_session_ready(chatgpt_api):
@@ -6255,7 +6498,12 @@ def reinvite_account(chatgpt_api, mail_client, acc):
                 threshold = _auto_check_config.get("threshold", AUTO_CHECK_THRESHOLD)
             except Exception:
                 threshold = 10
-            status_str, info = check_codex_quota(access_token, account_id=bundle.get("account_id") or None)
+            try:
+                status_str, info = check_codex_quota(access_token, account_id=bundle.get("account_id") or None)
+            except TypeError as exc:
+                if "account_id" not in str(exc):
+                    raise
+                status_str, info = check_codex_quota(access_token)
             if status_str == "ok" and isinstance(info, dict):
                 # 不论真假恢复,都写一份最新 last_quota:UI 上看到的额度必须是最新事实,
                 # 否则用户/下游看到的还是上次成功时的旧值(比如 0% 剩 100%)误判可用,
@@ -6357,6 +6605,7 @@ def reinvite_account(chatgpt_api, mail_client, acc):
     update_account(
         email,
         status=STATUS_ACTIVE,
+        seat_type=SEAT_CHATGPT,
         last_active_at=time.time(),
         auth_file=auth_file,
         workspace_account_id=get_chatgpt_account_id() or None,
@@ -6723,6 +6972,10 @@ def _reuse_one_standby(
 
         logger.info("[4/5] 复用: %s", email)
         chatgpt = chatgpt_provider()
+        if _seat_swap_enabled():
+            if not _promote_team_member_to_chatgpt_seat(chatgpt, email):
+                logger.warning("[4/5] %s codex → ChatGPT seat 失败,跳过本候选", email)
+                return {"email": email, "result": "failed", "error": "seat_promote_failed"}
         mail_client = mail_provider(acc)
         ok = reinvite_callable(chatgpt, mail_client, acc)
         if ok:
@@ -6784,8 +7037,12 @@ def cmd_rotate(target_seats=3, force_auth_repair=False, background_post_sync=Fal
         return True
 
     skip_reuse = bool(ROTATE_SKIP_REUSE)
+    seat_swap_mode = _seat_swap_enabled()
+    seat_swap_fallback_kick = _seat_swap_fallback_kick_enabled()
     if skip_reuse:
         logger.info("[轮转] ROTATE_SKIP_REUSE 启用：跳过旧号复用，优先释放不可用占席子号后创建新号")
+    if seat_swap_mode:
+        logger.info("[轮转] Seat-swap 模式启用：exhausted ChatGPT 席降为 codex standby，再提升 codex standby 补位")
 
     chatgpt = None
     mail_client = None
@@ -6932,6 +7189,7 @@ def cmd_rotate(target_seats=3, force_auth_repair=False, background_post_sync=Fal
         removed_now = 0
         already_absent_count = 0
         removed_blocker_emails: set[str] = set()
+        downgraded_now = 0
 
         if all_exhausted:
             logger.info("[3/5] 移出 %d 个不可用占席账号...", len(all_exhausted))
@@ -6944,6 +7202,17 @@ def cmd_rotate(target_seats=3, force_auth_repair=False, background_post_sync=Fal
                 reason = _replaceable_pool_blocker_reason(acc) or "replaceable_pool_blocker"
                 if not _chatgpt_session_ready(chatgpt):
                     chatgpt.start()
+                if seat_swap_mode and reason == "quota_exhausted":
+                    if _downgrade_team_member_to_codex_standby(chatgpt, acc, reason="seat_swap:quota_exhausted"):
+                        normalized_removed = _normalized_email(email)
+                        if normalized_removed:
+                            removed_blocker_emails.add(normalized_removed)
+                        downgraded_now += 1
+                        logger.info("[3/5] %s ChatGPT → codex standby（不移出 Team）", email)
+                        continue
+                    if not seat_swap_fallback_kick:
+                        logger.warning("[3/5] %s seat-swap 降级失败且禁用 fallback kick,本轮不移出", email)
+                        continue
                 remove_status = remove_from_team(chatgpt, email, return_status=True)
                 if remove_status in ("removed", "already_absent"):
                     _mark_standby_after_team_exit(email, reason=reason)
@@ -6969,12 +7238,20 @@ def cmd_rotate(target_seats=3, force_auth_repair=False, background_post_sync=Fal
             ensure_chatgpt()
         api_count = get_team_member_count(chatgpt)
         logger.info(
-            "[4/5] API 返回成员数: %d（实际移出: %d，远端已缺席: %d）",
+            "[4/5] API 返回成员数: %d（实际移出: %d，远端已缺席: %d，降 codex: %d）",
             api_count,
             removed_now,
             already_absent_count,
+            downgraded_now,
         )
-        if api_count <= 0:
+        if seat_swap_mode:
+            current_count = 1 + _count_pool_active_accounts(require_auth=True)
+            logger.info(
+                "[4/5] Seat-swap 可用 ChatGPT 池估算: %d/%d（主号 + active/chatgpt/auth 子号）",
+                current_count,
+                TARGET,
+            )
+        elif api_count <= 0:
             # API 返回异常,用 _estimate_local_team_member_count 兜底
             # (上游 `.upstream/manager.py:183` 等价: ACTIVE+EXHAUSTED+AUTH_INVALID 全算席位).
             local_estimate = _estimate_local_team_member_count(TARGET)
@@ -7001,6 +7278,9 @@ def cmd_rotate(target_seats=3, force_auth_repair=False, background_post_sync=Fal
 
         if vacancies <= 0:
             excess = current_count - TARGET
+            if seat_swap_mode:
+                logger.info("[4/5] Seat-swap ChatGPT 可用池已满 (%d/%d)", current_count, TARGET)
+                return
             if excess > 0:
                 logger.info("[4/5] Team 超员 (%d/%d)，清理 %d 个多余成员...", current_count, TARGET, excess)
                 # 只移除本地管理的账号，优先移除额度最低的

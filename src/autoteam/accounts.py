@@ -28,7 +28,7 @@ _accounts_io_lock = threading.RLock()
 # 账号状态
 STATUS_ACTIVE = "active"  # 在 team 中，额度可用
 STATUS_EXHAUSTED = "exhausted"  # 在 team 中，额度用完
-STATUS_STANDBY = "standby"  # 已移出 team，等待额度恢复
+STATUS_STANDBY = "standby"  # 待命/不发布 CPA；seat-swap 模式下可仍在 Team 的 codex 席
 STATUS_PENDING = "pending"  # 已邀请，等待注册完成
 STATUS_PERSONAL = "personal"  # 已主动退出 team，走个人号 Codex OAuth，不再参与 Team 轮转
 STATUS_AUTH_INVALID = "auth_invalid"  # auth_file token 已不可用(401/403),待 reconcile 清理或重登

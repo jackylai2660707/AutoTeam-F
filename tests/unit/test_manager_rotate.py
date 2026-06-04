@@ -419,6 +419,153 @@ def test_cmd_rotate_target2_refills_after_exhausted_removal_despite_transient_ov
     ] == manager.STATUS_ACTIVE
 
 
+def test_update_team_member_seat_type_patches_member_id_then_account_user_id(monkeypatch):
+    calls = []
+
+    class FakeChatGPT:
+        browser = True
+
+        def start(self):
+            raise AssertionError("already started")
+
+        def _api_fetch(self, method, path, body=None):
+            calls.append((method, path, body))
+            if method == "PATCH" and path.endswith("/users/user-id"):
+                return {"status": 404, "body": "not found"}
+            if method == "PATCH" and path.endswith("/users/account-user-id"):
+                return {"status": 200, "body": "{}"}
+            raise AssertionError((method, path, body))
+
+    monkeypatch.setattr(manager, "get_chatgpt_account_id", lambda: "acct")
+
+    ok = manager._update_team_member_seat_type(
+        FakeChatGPT(),
+        "child@example.com",
+        manager.SEAT_CODEX,
+        member={
+            "email": "child@example.com",
+            "id": "user-id",
+            "account_user_id": "account-user-id",
+            "seat_type": "default",
+        },
+    )
+
+    assert ok is True
+    assert calls == [
+        ("PATCH", "/backend-api/accounts/acct/users/user-id", {"seat_type": "usage_based"}),
+        ("PATCH", "/backend-api/accounts/acct/users/account-user-id", {"seat_type": "usage_based"}),
+    ]
+
+
+def test_cmd_rotate_seat_swap_downgrades_exhausted_and_promotes_standby(tmp_path, monkeypatch):
+    import autoteam.config as config
+
+    chatgpt = _FakeChatGPT()
+    old_auth = tmp_path / "old.json"
+    standby_auth = tmp_path / "standby.json"
+    old_auth.write_text('{"access_token": "old-token"}', encoding="utf-8")
+    standby_auth.write_text('{"access_token": "standby-token"}', encoding="utf-8")
+
+    state = {
+        "accounts": [
+            {
+                "email": "old@example.com",
+                "status": manager.STATUS_EXHAUSTED,
+                "seat_type": manager.SEAT_CHATGPT,
+                "auth_file": str(old_auth),
+                "last_quota": {"primary_pct": 100, "primary_resets_at": 1_700_001_000},
+            },
+            {
+                "email": "standby@example.com",
+                "status": manager.STATUS_STANDBY,
+                "seat_type": manager.SEAT_CODEX,
+                "auth_file": str(standby_auth),
+                "last_quota": {"primary_pct": 5, "primary_resets_at": 9_999_999_999},
+                "_quota_recovered": True,
+            },
+        ]
+    }
+    events = []
+
+    def fake_load_accounts():
+        return [dict(acc) for acc in state["accounts"]]
+
+    def fake_update(email, **kwargs):
+        events.append(("update", email, kwargs.get("status"), kwargs.get("seat_type"), kwargs.get("_reason")))
+        for acc in state["accounts"]:
+            if acc["email"] == email:
+                acc.update({k: v for k, v in kwargs.items() if not k.startswith("_")})
+                return acc
+        return None
+
+    def fake_downgrade(_chatgpt, acc, *, reason):
+        events.append(("downgrade", acc["email"], reason))
+        fake_update(
+            acc["email"],
+            status=manager.STATUS_STANDBY,
+            seat_type=manager.SEAT_CODEX,
+            auth_file=None,
+            _reason=reason,
+        )
+        return True
+
+    def fake_promote(_chatgpt, email):
+        events.append(("promote", email))
+        fake_update(email, seat_type=manager.SEAT_CHATGPT, _reason="seat_swap:promote_chatgpt")
+        return True
+
+    def fake_reinvite(_chatgpt, _mail, acc):
+        events.append(("reinvite", acc["email"]))
+        fake_update(
+            acc["email"],
+            status=manager.STATUS_ACTIVE,
+            seat_type=manager.SEAT_CHATGPT,
+            auth_file=str(standby_auth),
+        )
+        return True
+
+    monkeypatch.setattr(config, "ROTATE_SKIP_REUSE", False)
+    monkeypatch.setattr(config, "ROTATE_SEAT_SWAP_ENABLED", True, raising=False)
+    monkeypatch.setattr(config, "ROTATE_SEAT_SWAP_FALLBACK_KICK", False, raising=False)
+    monkeypatch.setattr(manager, "sync_account_states", lambda: events.append(("sync_account_states", None)))
+    monkeypatch.setattr(manager, "cmd_check", lambda **kwargs: events.append(("cmd_check", None)))
+    monkeypatch.setattr(manager, "ChatGPTTeamAPI", lambda: chatgpt)
+    monkeypatch.setattr(manager, "CloudMailClient", lambda: _FakeMailClient())
+    monkeypatch.setattr(manager, "load_accounts", fake_load_accounts)
+    monkeypatch.setattr(manager, "update_account", fake_update)
+    monkeypatch.setattr(manager, "get_team_member_count", lambda _chatgpt: 2)
+    monkeypatch.setattr(manager, "_select_reuse_candidates", lambda accounts, threshold, **kwargs: list(accounts))
+    monkeypatch.setattr(
+        manager,
+        "get_standby_accounts",
+        lambda: [dict(acc) for acc in state["accounts"] if acc["status"] == manager.STATUS_STANDBY],
+    )
+    monkeypatch.setattr(manager, "check_codex_quota", lambda *_args, **_kwargs: ("ok", {"primary_pct": 5}))
+    monkeypatch.setattr(manager, "_downgrade_team_member_to_codex_standby", fake_downgrade)
+    monkeypatch.setattr(manager, "_promote_team_member_to_chatgpt_seat", fake_promote)
+    monkeypatch.setattr(manager, "reinvite_account", fake_reinvite)
+    monkeypatch.setattr(
+        manager,
+        "remove_from_team",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("seat-swap must not kick exhausted seats")),
+    )
+    monkeypatch.setattr(
+        manager,
+        "create_new_account",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("should promote standby before creating")),
+    )
+    monkeypatch.setattr(manager, "sync_to_cpa", lambda: events.append(("sync_to_cpa", None)))
+
+    manager.cmd_rotate(target_seats=2)
+
+    assert ("downgrade", "old@example.com", "seat_swap:quota_exhausted") in events
+    assert events.index(("promote", "standby@example.com")) < events.index(("reinvite", "standby@example.com"))
+    assert next(acc for acc in state["accounts"] if acc["email"] == "old@example.com")["status"] == manager.STATUS_STANDBY
+    standby = next(acc for acc in state["accounts"] if acc["email"] == "standby@example.com")
+    assert standby["status"] == manager.STATUS_ACTIVE
+    assert standby["seat_type"] == manager.SEAT_CHATGPT
+
+
 def test_replace_single_waits_for_remote_capacity_before_deciding_fill(monkeypatch):
     chatgpt = _FakeChatGPT()
     mail = _FakeMailClient()

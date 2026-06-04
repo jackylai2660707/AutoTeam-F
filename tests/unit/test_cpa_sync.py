@@ -94,6 +94,66 @@ def test_sync_to_cpa_skips_disabled_accounts_and_keeps_remote_when_active_pool_i
     assert result["delete_guard"]["skipped_remote_delete"] == 1
 
 
+def test_sync_to_cpa_deletes_codex_only_remote_even_when_active_pool_is_unstable(monkeypatch, tmp_path):
+    active_auth = tmp_path / "codex-active@example.com-team-a.json"
+    codex_auth = tmp_path / "codex-codex-only@example.com-team-b.json"
+    stale_auth = tmp_path / "codex-stale@example.com-team-c.json"
+    active_auth.write_text('{"access_token":"token-active"}', encoding="utf-8")
+    codex_auth.write_text('{"access_token":"token-codex"}', encoding="utf-8")
+    stale_auth.write_text('{"access_token":"token-stale"}', encoding="utf-8")
+
+    monkeypatch.setattr(
+        "autoteam.accounts.load_accounts",
+        lambda: [
+            {
+                "email": "active@example.com",
+                "status": "active",
+                "seat_type": "chatgpt",
+                "auth_file": str(active_auth),
+                "disabled": False,
+            },
+            {
+                "email": "codex-only@example.com",
+                "status": "standby",
+                "seat_type": "codex",
+                "auth_file": str(codex_auth),
+                "disabled": False,
+            },
+            {
+                "email": "stale@example.com",
+                "status": "standby",
+                "auth_file": "",
+                "disabled": False,
+            },
+        ],
+    )
+    monkeypatch.setattr("autoteam.accounts.save_accounts", lambda _accounts: None)
+    monkeypatch.setattr(cpa_sync, "_cleanup_local_duplicates", lambda _accounts: (0, False))
+    monkeypatch.setattr(
+        cpa_sync,
+        "list_cpa_files",
+        lambda: [
+            {"name": active_auth.name, "email": "active@example.com"},
+            {"name": codex_auth.name, "email": "codex-only@example.com"},
+            {"name": stale_auth.name, "email": "stale@example.com"},
+        ],
+    )
+
+    uploaded = []
+    deleted = []
+    monkeypatch.setattr("autoteam.codex_auth.check_codex_quota", lambda *_args, **_kwargs: ("ok", {}))
+    monkeypatch.setattr(cpa_sync, "upload_to_cpa", lambda path: uploaded.append(Path(path).name) or True)
+    monkeypatch.setattr(cpa_sync, "delete_from_cpa", lambda name: deleted.append(name) or True)
+
+    result = cpa_sync.sync_to_cpa()
+
+    assert uploaded == [active_auth.name]
+    assert deleted == [codex_auth.name]
+    assert result["delete_guard"]["allow_remote_delete"] is False
+    assert result["delete_guard"]["skipped_remote_delete"] == 1
+    assert result["active_publish"]["codex_excluded_remote_delete"] == 1
+
+
 def test_sync_to_cpa_allows_remote_delete_when_active_pool_is_stable(monkeypatch, tmp_path):
     first_auth = tmp_path / "codex-first@example.com-team-a.json"
     second_auth = tmp_path / "codex-second@example.com-team-b.json"

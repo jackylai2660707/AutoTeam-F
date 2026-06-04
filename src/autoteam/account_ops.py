@@ -189,6 +189,27 @@ def team_member_role(member):
     return None
 
 
+def team_member_account_user_id(member):
+    for source in (member, (member or {}).get("account_user") or {}, (member or {}).get("user") or {}):
+        if not isinstance(source, dict):
+            continue
+        for key in ("account_user_id", "accountUserId"):
+            value = source.get(key)
+            if value:
+                return value
+    return None
+
+
+def team_member_seat_type(member) -> str:
+    for source in (member, (member or {}).get("account_user") or {}, (member or {}).get("user") or {}):
+        if not isinstance(source, dict):
+            continue
+        value = source.get("seat_type")
+        if value:
+            return str(value).strip().lower()
+    return ""
+
+
 def delete_team_invite(chatgpt_api, account_id: str, invite: dict | None = None, *, invite_id=None, email: str | None = None):
     """Cancel a Team invite across known ChatGPT API variants."""
     invite = invite or {}
