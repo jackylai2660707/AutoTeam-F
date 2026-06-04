@@ -509,7 +509,7 @@ def test_cmd_rotate_seat_swap_downgrades_exhausted_and_promotes_standby(tmp_path
         )
         return True
 
-    def fake_promote(_chatgpt, email):
+    def fake_promote(_chatgpt, email, **_kwargs):
         events.append(("promote", email))
         fake_update(email, seat_type=manager.SEAT_CHATGPT, _reason="seat_swap:promote_chatgpt")
         return True
@@ -564,6 +564,35 @@ def test_cmd_rotate_seat_swap_downgrades_exhausted_and_promotes_standby(tmp_path
     standby = next(acc for acc in state["accounts"] if acc["email"] == "standby@example.com")
     assert standby["status"] == manager.STATUS_ACTIVE
     assert standby["seat_type"] == manager.SEAT_CHATGPT
+
+
+def test_cmd_rotate_seat_swap_does_not_create_when_remote_chatgpt_child_seats_full(monkeypatch):
+    import autoteam.config as config
+
+    chatgpt = _FakeChatGPT()
+    events = []
+
+    monkeypatch.setattr(config, "ROTATE_SKIP_REUSE", False)
+    monkeypatch.setattr(config, "ROTATE_SEAT_SWAP_ENABLED", True, raising=False)
+    monkeypatch.setattr(manager, "sync_account_states", lambda: events.append(("sync_account_states", None)))
+    monkeypatch.setattr(manager, "cmd_check", lambda **kwargs: events.append(("cmd_check", None)))
+    monkeypatch.setattr(manager, "ChatGPTTeamAPI", lambda: chatgpt)
+    monkeypatch.setattr(manager, "CloudMailClient", lambda: _FakeMailClient())
+    monkeypatch.setattr(manager, "load_accounts", lambda: [])
+    monkeypatch.setattr(manager, "get_standby_accounts", lambda: [])
+    monkeypatch.setattr(manager, "get_team_member_count", lambda _chatgpt: 3)
+    monkeypatch.setattr(manager, "_count_pool_active_accounts", lambda require_auth=True: 1)
+    monkeypatch.setattr(manager, "_count_remote_chatgpt_child_seats", lambda _chatgpt: 2)
+    monkeypatch.setattr(
+        manager,
+        "create_new_account",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("remote ChatGPT seat guard must stop create")),
+    )
+    monkeypatch.setattr(manager, "sync_to_cpa", lambda: events.append(("sync_to_cpa", None)))
+
+    manager.cmd_rotate(target_seats=3)
+
+    assert ("sync_account_states", None) in events
 
 
 def test_replace_single_waits_for_remote_capacity_before_deciding_fill(monkeypatch):

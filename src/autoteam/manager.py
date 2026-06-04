@@ -894,6 +894,37 @@ def _fetch_team_member_by_email(chatgpt_api, email: str | None) -> dict | None:
     return None
 
 
+def _fetch_team_members_for_seat_swap(chatgpt_api) -> list[dict]:
+    account_id = get_chatgpt_account_id()
+    if not account_id:
+        return []
+    if not _chatgpt_session_ready(chatgpt_api):
+        chatgpt_api.start()
+    result = chatgpt_api._api_fetch("GET", f"/backend-api/accounts/{account_id}/users")
+    if result.get("status") != 200:
+        logger.warning("[SeatSwap] 获取 Team users 失败: HTTP %s %s", result.get("status"), (result.get("body") or "")[:160])
+        return []
+    try:
+        data = json.loads(result.get("body") or "{}")
+    except Exception as exc:
+        logger.warning("[SeatSwap] 解析 Team users 失败: %s", exc)
+        return []
+    members = data.get("items", data.get("users", data.get("members", [])))
+    return members if isinstance(members, list) else []
+
+
+def _count_remote_chatgpt_child_seats(chatgpt_api) -> int:
+    """Count remote child members currently occupying ChatGPT (`default`) seats."""
+    count = 0
+    for member in _fetch_team_members_for_seat_swap(chatgpt_api):
+        email = team_member_email(member)
+        if not email or _is_main_account_email(email):
+            continue
+        if _local_seat_type_from_remote(team_member_seat_type(member)) == SEAT_CHATGPT:
+            count += 1
+    return count
+
+
 def _update_team_member_seat_type(chatgpt_api, email: str, seat_type: str, *, member: dict | None = None) -> bool:
     """PATCH a Team member seat type (`default` or `usage_based`)."""
     account_id = get_chatgpt_account_id()
@@ -965,12 +996,26 @@ def _downgrade_team_member_to_codex_standby(chatgpt_api, acc: dict, *, reason: s
     return True
 
 
-def _promote_team_member_to_chatgpt_seat(chatgpt_api, email: str) -> bool:
+def _promote_team_member_to_chatgpt_seat(chatgpt_api, email: str, *, max_child_chatgpt_seats: int | None = None) -> bool:
     if not email or _is_main_account_email(email):
         return False
     if not _chatgpt_session_ready(chatgpt_api):
         chatgpt_api.start()
-    ok = _update_team_member_seat_type(chatgpt_api, email, SEAT_CHATGPT)
+    member = _fetch_team_member_by_email(chatgpt_api, email)
+    if member and _local_seat_type_from_remote(team_member_seat_type(member)) == SEAT_CHATGPT:
+        update_account(email, seat_type=SEAT_CHATGPT, _reason="seat_swap:already_chatgpt")
+        return True
+    if max_child_chatgpt_seats is not None:
+        current_child_seats = _count_remote_chatgpt_child_seats(chatgpt_api)
+        if current_child_seats >= int(max_child_chatgpt_seats):
+            logger.warning(
+                "[SeatSwap] 远端 ChatGPT 子席位已满 (%d/%d),拒绝提升 %s",
+                current_child_seats,
+                int(max_child_chatgpt_seats),
+                email,
+            )
+            return False
+    ok = _update_team_member_seat_type(chatgpt_api, email, SEAT_CHATGPT, member=member)
     if ok:
         update_account(email, seat_type=SEAT_CHATGPT, _reason="seat_swap:promote_chatgpt")
     return ok
@@ -6869,6 +6914,7 @@ def _reuse_one_standby(
     reinvite_fn=None,
     quota_fn=None,
     now=None,
+    max_child_chatgpt_seats: int | None = None,
 ) -> dict:
     """Process one standby account end-to-end.
 
@@ -6973,7 +7019,11 @@ def _reuse_one_standby(
         logger.info("[4/5] 复用: %s", email)
         chatgpt = chatgpt_provider()
         if _seat_swap_enabled():
-            if not _promote_team_member_to_chatgpt_seat(chatgpt, email):
+            if not _promote_team_member_to_chatgpt_seat(
+                chatgpt,
+                email,
+                max_child_chatgpt_seats=max_child_chatgpt_seats,
+            ):
                 logger.warning("[4/5] %s codex → ChatGPT seat 失败,跳过本候选", email)
                 return {"email": email, "result": "failed", "error": "seat_promote_failed"}
         mail_client = mail_provider(acc)
@@ -7349,6 +7399,7 @@ def cmd_rotate(target_seats=3, force_auth_repair=False, background_post_sync=Fal
                 threshold,
                 chatgpt_provider=_chatgpt_provider,
                 mail_provider=ensure_account_mail,
+                max_child_chatgpt_seats=(TARGET - 1 if seat_swap_mode else None),
             )
 
         outcomes: list[dict] = []
@@ -7465,6 +7516,16 @@ def cmd_rotate(target_seats=3, force_auth_repair=False, background_post_sync=Fal
                 logger.info("[5/5] 创建第 %d/%d 个...", i + 1, remaining)
                 if not chatgpt or not _chatgpt_session_ready(chatgpt):
                     ensure_chatgpt()
+                if seat_swap_mode:
+                    remote_child_chatgpt = _count_remote_chatgpt_child_seats(chatgpt)
+                    max_child_chatgpt = max(0, TARGET - 1)
+                    if remote_child_chatgpt >= max_child_chatgpt:
+                        logger.warning(
+                            "[5/5] 远端 ChatGPT 子席位已满 (%d/%d),停止创建新号以保证席位上限",
+                            remote_child_chatgpt,
+                            max_child_chatgpt,
+                        )
+                        break
                 created_email = create_new_account(chatgpt, ensure_mail())
                 if created_email and (
                     not isinstance(created_email, str)
