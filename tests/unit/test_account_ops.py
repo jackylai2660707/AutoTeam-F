@@ -259,6 +259,9 @@ def test_get_team_members_api_uses_normalized_team_shape_helpers(monkeypatch):
                 "role": "admin",
                 "user_id": "user-1",
                 "is_local": True,
+                "is_main_account": False,
+                "seat_type": "unknown",
+                "seat_type_raw": "",
                 "type": "member",
             },
             {
@@ -266,11 +269,21 @@ def test_get_team_members_api_uses_normalized_team_shape_helpers(monkeypatch):
                 "role": "member",
                 "user_id": "inv-1",
                 "is_local": False,
+                "is_main_account": False,
+                "seat_type": "invite",
+                "seat_type_raw": "",
                 "type": "invite",
             },
         ],
         "total": 1,
         "invites": 1,
+        "seat_summary": {
+            "chatgpt": 0,
+            "codex": 0,
+            "unknown": 1,
+            "child_chatgpt": 0,
+            "max_child_chatgpt": 2,
+        },
     }
     assert len(instances) == 1
     assert instances[0].stopped is True

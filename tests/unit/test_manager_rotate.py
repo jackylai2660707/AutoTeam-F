@@ -457,6 +457,35 @@ def test_update_team_member_seat_type_patches_member_id_then_account_user_id(mon
     ]
 
 
+def test_promote_team_member_refuses_when_remote_chatgpt_seat_count_unknown(monkeypatch):
+    class FakeChatGPT:
+        browser = True
+
+    monkeypatch.setattr(
+        manager,
+        "_fetch_team_member_by_email",
+        lambda _chatgpt, _email: {
+            "email": "standby@example.com",
+            "id": "user-id",
+            "seat_type": "usage_based",
+        },
+    )
+    monkeypatch.setattr(manager, "_count_remote_chatgpt_child_seats", lambda _chatgpt: None)
+    monkeypatch.setattr(
+        manager,
+        "_update_team_member_seat_type",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must fail closed before PATCH")),
+    )
+
+    ok = manager._promote_team_member_to_chatgpt_seat(
+        FakeChatGPT(),
+        "standby@example.com",
+        max_child_chatgpt_seats=2,
+    )
+
+    assert ok is False
+
+
 def test_cmd_rotate_seat_swap_downgrades_exhausted_and_promotes_standby(tmp_path, monkeypatch):
     import autoteam.config as config
 
@@ -593,6 +622,43 @@ def test_cmd_rotate_seat_swap_does_not_create_when_remote_chatgpt_child_seats_fu
     manager.cmd_rotate(target_seats=3)
 
     assert ("sync_account_states", None) in events
+
+
+def test_sync_account_states_ignores_usage_based_main_account(monkeypatch):
+    main_email = "owner@example.com"
+    updates = []
+
+    class FakeChatGPT:
+        def is_started(self):
+            return True
+
+        def _api_fetch(self, method, path):
+            assert method == "GET"
+            assert path == "/backend-api/accounts/acct/users"
+            return {
+                "status": 200,
+                "body": '{"items":[{"email":"owner@example.com","seat_type":"usage_based"}]}',
+            }
+
+    monkeypatch.setattr(manager, "get_chatgpt_account_id", lambda: "acct")
+    monkeypatch.setattr(manager, "_is_main_account_email", lambda email: (email or "").lower() == main_email)
+    monkeypatch.setattr(
+        manager,
+        "load_accounts",
+        lambda: [
+            {
+                "email": main_email,
+                "status": manager.STATUS_ACTIVE,
+                "seat_type": manager.SEAT_UNKNOWN,
+                "auth_file": "/auths/codex-main.json",
+            }
+        ],
+    )
+    monkeypatch.setattr(manager, "update_account", lambda email, **kwargs: updates.append((email, kwargs)))
+
+    manager.sync_account_states(FakeChatGPT())
+
+    assert updates == []
 
 
 def test_replace_single_waits_for_remote_capacity_before_deciding_fill(monkeypatch):

@@ -14,8 +14,16 @@
 
     <div v-if="data" class="space-y-4">
       <!-- 统计 -->
-      <div class="flex gap-4 text-sm">
+      <div class="flex gap-2 text-sm flex-wrap">
         <span class="px-3 py-1.5 bg-ink-50 rounded-lg text-ink-600 border border-hairline">成员: <span class="text-ink-950 font-medium">{{ data.total }}</span></span>
+        <span class="px-3 py-1.5 bg-emerald-50 rounded-lg text-emerald-800 border border-emerald-200">
+          ChatGPT 子席位:
+          <span class="font-medium">{{ seatSummary.child_chatgpt || 0 }}/{{ seatSummary.max_child_chatgpt || 2 }}</span>
+        </span>
+        <span class="px-3 py-1.5 bg-amber-50 rounded-lg text-amber-800 border border-amber-200">
+          Codex/usage_based:
+          <span class="font-medium">{{ seatSummary.codex || 0 }}</span>
+        </span>
         <span v-if="data.invites > 0" class="px-3 py-1.5 bg-amber-50 rounded-lg text-amber-800 border border-amber-200">待接受邀请: <span class="font-medium">{{ data.invites }}</span></span>
       </div>
 
@@ -28,6 +36,7 @@
                 <th class="px-4 py-3 font-medium">#</th>
                 <th class="px-4 py-3 font-medium">邮箱</th>
                 <th class="px-4 py-3 font-medium">角色</th>
+                <th class="px-4 py-3 font-medium">席位</th>
                 <th class="px-4 py-3 font-medium">类型</th>
                 <th class="px-4 py-3 font-medium">来源</th>
                 <th class="px-4 py-3 font-medium text-right">操作</th>
@@ -46,6 +55,12 @@
                       'bg-ink-50 text-ink-600': m.role !== 'account-owner' && m.role !== 'account-admin',
                     }">
                     {{ m.role || 'member' }}
+                  </span>
+                </td>
+                <td class="px-4 py-3">
+                  <span class="px-2 py-0.5 rounded text-xs font-bold uppercase tracking-wide border"
+                    :class="seatClass(m)">
+                    {{ seatLabel(m) }}
                   </span>
                 </td>
                 <td class="px-4 py-3">
@@ -90,7 +105,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue'
+import { computed, ref, onMounted } from 'vue'
 import { api } from '../api.js'
 
 const data = ref(null)
@@ -99,6 +114,7 @@ const error = ref('')
 const removingId = ref('')
 
 const CACHE_KEY = 'autoteam_team_members'
+const seatSummary = computed(() => data.value?.seat_summary || {})
 
 function loadCache() {
   try {
@@ -122,6 +138,20 @@ function saveCache(d) {
 
 function memberKey(member) {
   return `${member.type}:${member.user_id}:${member.email}`
+}
+
+function seatLabel(member) {
+  if (member.type === 'invite') return 'Invite'
+  if (member.seat_type === 'chatgpt') return 'ChatGPT'
+  if (member.seat_type === 'codex') return 'Codex'
+  return member.seat_type_raw || 'Unknown'
+}
+
+function seatClass(member) {
+  if (member.type === 'invite') return 'bg-amber-50 text-amber-700 border-amber-200'
+  if (member.seat_type === 'chatgpt') return 'bg-emerald-50 text-emerald-700 border-emerald-200'
+  if (member.seat_type === 'codex') return 'bg-slate-50 text-slate-700 border-slate-200'
+  return 'bg-ink-50 text-ink-600 border-hairline'
 }
 
 async function fetchMembers() {

@@ -7,6 +7,8 @@
       :loading="masterHealthBusy"
       @refresh="onRefreshMasterHealth" />
 
+    <SeatStrategyCard :status="status" />
+
     <!-- F6 Pool health card -->
     <PoolHealthCard
       :accounts="status.accounts || []"
@@ -115,6 +117,7 @@
               <th class="px-3 py-3 font-semibold">#</th>
               <th class="px-4 py-3 font-semibold">邮箱</th>
               <th class="px-4 py-3 font-semibold">状态</th>
+              <th class="px-4 py-3 font-semibold">席位 / CPA</th>
               <th class="px-4 py-3 font-semibold">实际可用</th>
               <th class="px-4 py-3 font-semibold text-right">5h 剩余</th>
               <th class="px-4 py-3 font-semibold text-right">周 剩余</th>
@@ -148,6 +151,17 @@
               </td>
               <td class="px-4 py-3.5">
                 <StatusBadge :status="acc.status" :grace-until="acc.grace_until" />
+              </td>
+              <td class="px-4 py-3.5">
+                <div class="flex flex-col items-start gap-1">
+                  <span class="px-2 py-0.5 rounded-md border text-[10px] uppercase tracking-widest font-bold"
+                    :class="seatClass(acc)">
+                    {{ seatLabel(acc) }}
+                  </span>
+                  <span class="text-[10px] font-semibold" :class="cpaClass(acc)">
+                    {{ cpaLabel(acc) }}
+                  </span>
+                </div>
               </td>
               <td class="px-4 py-3.5">
                 <UsabilityCell :account="acc" />
@@ -332,6 +346,7 @@ import StatusBadge from './StatusBadge.vue'
 import UsabilityCell from './UsabilityCell.vue'
 import MasterHealthBanner from './MasterHealthBanner.vue'
 import PoolHealthCard from './PoolHealthCard.vue'
+import SeatStrategyCard from './SeatStrategyCard.vue'
 import AtButton from './AtButton.vue'
 import { ChevronLeft, ChevronRight, Download, RefreshCw, Trash2, X } from 'lucide-vue-next'
 import {
@@ -514,6 +529,40 @@ function quotaReset(acc, type) {
   return formatQuotaReset(qi, type)
 }
 function pctColor(remain) { return quotaPctColor(remain) }
+
+function normalizedSeat(acc) {
+  return String(acc?.seat_type || '').trim().toLowerCase()
+}
+function seatLabel(acc) {
+  if (acc?.is_main_account) return 'Master'
+  const seat = normalizedSeat(acc)
+  if (seat === 'chatgpt') return 'ChatGPT'
+  if (seat === 'codex') return 'Codex'
+  return 'Unknown'
+}
+function seatClass(acc) {
+  if (acc?.is_main_account) return 'bg-ink-950 text-white border-ink-950'
+  const seat = normalizedSeat(acc)
+  if (seat === 'chatgpt') return 'bg-emerald-50 text-emerald-700 border-emerald-200'
+  if (seat === 'codex') return 'bg-amber-50 text-amber-800 border-amber-200'
+  return 'bg-slate-50 text-slate-700 border-slate-200'
+}
+function cpaLabel(acc) {
+  if (acc?.is_main_account) return '不参与 CPA 子号池'
+  const seat = normalizedSeat(acc)
+  const raw = acc?.raw_status || acc?.status
+  if (raw === 'active' && seat === 'chatgpt' && acc?.auth_file) return 'CPA 发布'
+  if (seat === 'codex') return 'CPA 不发布'
+  if (!acc?.auth_file) return '缺 OAuth'
+  return '待验证'
+}
+function cpaClass(acc) {
+  const label = cpaLabel(acc)
+  if (label === 'CPA 发布') return 'text-sky-700'
+  if (label === 'CPA 不发布') return 'text-amber-700'
+  if (label === '缺 OAuth') return 'text-rose-700'
+  return 'text-ink-500'
+}
 
 const exportJson = computed(() => {
   if (!exportData.value) return ''

@@ -74,6 +74,54 @@ def test_get_status_survives_runtime_resource_probe_failure(monkeypatch):
     assert result["runtime_resources"] == {"error": "runtime_resource_snapshot_failed"}
 
 
+def test_get_status_exposes_seat_rotation_summary(monkeypatch):
+    monkeypatch.setattr(api, "_is_main_account_email", lambda email: email == "owner@example.com")
+    monkeypatch.setattr(config, "AUTO_CHECK_TARGET_SEATS", 3, raising=False)
+    monkeypatch.setattr(config, "ROTATE_SEAT_SWAP_ENABLED", True, raising=False)
+    monkeypatch.setattr(config, "ROTATE_SEAT_SWAP_FALLBACK_KICK", False, raising=False)
+    now = time.time()
+    monkeypatch.setattr(
+        "autoteam.accounts.load_accounts",
+        lambda: [
+            {"email": "owner@example.com", "status": accounts.STATUS_ACTIVE, "seat_type": "unknown"},
+            {
+                "email": "chatgpt@example.com",
+                "status": accounts.STATUS_ACTIVE,
+                "seat_type": accounts.SEAT_CHATGPT,
+                "auth_file": "/auths/chatgpt.json",
+            },
+            {
+                "email": "blocked@example.com",
+                "status": accounts.STATUS_STANDBY,
+                "seat_type": accounts.SEAT_CODEX,
+                "quota_resets_at": now + 3600,
+            },
+            {
+                "email": "ready@example.com",
+                "status": accounts.STATUS_STANDBY,
+                "seat_type": accounts.SEAT_CODEX,
+                "quota_resets_at": now - 60,
+            },
+        ],
+    )
+
+    result = api.get_status(fast=True)
+
+    assert result["seat_rotation"] == {
+        "enabled": True,
+        "fallback_kick_enabled": False,
+        "target_total_seats": 3,
+        "max_child_chatgpt_seats": 2,
+        "local_child_chatgpt_active": 1,
+        "local_cpa_team_publishable": 1,
+        "local_codex_standby": 2,
+        "local_codex_any": 2,
+        "local_codex_recovered": 1,
+        "local_codex_quota_blocked": 1,
+        "chatgpt_cap_ok": True,
+    }
+
+
 def test_check_account_codex_quota_uses_auth_file_account_id(tmp_path, monkeypatch):
     auth_file = tmp_path / "codex-child@example.com-team.json"
     auth_file.write_text(

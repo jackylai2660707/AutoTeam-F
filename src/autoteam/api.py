@@ -1248,6 +1248,65 @@ def _sanitize_account(acc: dict, quota_snapshot: dict | None = None) -> dict:
     return sanitized
 
 
+def _seat_rotation_summary(sanitized_accounts: list[dict]) -> dict:
+    """Local seat-swap summary for UI; remote exact seat counts live in /api/team/members."""
+    from autoteam.accounts import SEAT_CHATGPT, SEAT_CODEX, STATUS_ACTIVE, STATUS_STANDBY
+    from autoteam.config import AUTO_CHECK_TARGET_SEATS, ROTATE_SEAT_SWAP_ENABLED, ROTATE_SEAT_SWAP_FALLBACK_KICK
+
+    child_accounts = [a for a in sanitized_accounts if not a.get("is_main_account")]
+    max_child_chatgpt = max(0, int(AUTO_CHECK_TARGET_SEATS) - 1)
+
+    def _seat(acc):
+        return str(acc.get("seat_type") or "").strip().lower()
+
+    def _raw_status(acc):
+        return str(acc.get("raw_status") or acc.get("status") or "").strip().lower()
+
+    chatgpt_active = [
+        a for a in child_accounts
+        if not a.get("disabled") and _raw_status(a) == STATUS_ACTIVE and _seat(a) == SEAT_CHATGPT
+    ]
+    cpa_team_publishable = [a for a in chatgpt_active if a.get("auth_file")]
+    codex_standby = [
+        a for a in child_accounts
+        if not a.get("disabled") and _raw_status(a) == STATUS_STANDBY and _seat(a) == SEAT_CODEX
+    ]
+    codex_any = [
+        a for a in child_accounts
+        if not a.get("disabled") and _seat(a) == SEAT_CODEX
+    ]
+
+    now_ts = time.time()
+    quota_blocked = 0
+    recovered = 0
+    for acc in codex_standby:
+        resets_at = acc.get("quota_resets_at")
+        if resets_at:
+            try:
+                if now_ts < float(resets_at):
+                    quota_blocked += 1
+                else:
+                    recovered += 1
+            except Exception:
+                pass
+        else:
+            recovered += 1
+
+    return {
+        "enabled": bool(ROTATE_SEAT_SWAP_ENABLED),
+        "fallback_kick_enabled": bool(ROTATE_SEAT_SWAP_FALLBACK_KICK),
+        "target_total_seats": int(AUTO_CHECK_TARGET_SEATS),
+        "max_child_chatgpt_seats": max_child_chatgpt,
+        "local_child_chatgpt_active": len(chatgpt_active),
+        "local_cpa_team_publishable": len(cpa_team_publishable),
+        "local_codex_standby": len(codex_standby),
+        "local_codex_any": len(codex_any),
+        "local_codex_recovered": recovered,
+        "local_codex_quota_blocked": quota_blocked,
+        "chatgpt_cap_ok": len(chatgpt_active) <= max_child_chatgpt,
+    }
+
+
 def _admin_status():
     from autoteam.admin_state import get_admin_state_summary
 
@@ -3014,6 +3073,7 @@ def get_status(fast: bool = False):
     return {
         "accounts": sanitized_accounts,
         "summary": summary,
+        "seat_rotation": _seat_rotation_summary(sanitized_accounts),
         "quota_cache": quota_cache,
         "runtime_resources": _safe_runtime_resource_snapshot(),
         "ipv6_pool": _safe_ipv6_pool_status(),
@@ -3211,10 +3271,12 @@ def get_team_members():
                 team_invite_email,
                 team_member_email,
                 team_member_role,
+                team_member_seat_type,
                 team_member_user_id,
             )
             from autoteam.accounts import load_accounts
             from autoteam.chatgpt_api import ChatGPTTeamAPI
+            from autoteam.config import AUTO_CHECK_TARGET_SEATS
 
             chatgpt = ChatGPTTeamAPI()
             try:
@@ -3223,14 +3285,35 @@ def get_team_members():
                 local_emails = {a["email"].lower() for a in load_accounts()}
 
                 result = []
+                seat_summary = {
+                    "chatgpt": 0,
+                    "codex": 0,
+                    "unknown": 0,
+                    "child_chatgpt": 0,
+                    "max_child_chatgpt": max(0, int(AUTO_CHECK_TARGET_SEATS) - 1),
+                }
                 for m in members:
                     email = team_member_email(m)
+                    raw_seat = team_member_seat_type(m)
+                    if raw_seat == "default":
+                        seat_type = "chatgpt"
+                    elif raw_seat == "usage_based":
+                        seat_type = "codex"
+                    else:
+                        seat_type = "unknown"
+                    seat_summary[seat_type] = seat_summary.get(seat_type, 0) + 1
+                    is_main = _is_main_account_email(email)
+                    if not is_main and seat_type == "chatgpt":
+                        seat_summary["child_chatgpt"] += 1
                     result.append(
                         {
                             "email": email,
                             "role": team_member_role(m) or "",
                             "user_id": team_member_user_id(m) or "",
                             "is_local": email in local_emails,
+                            "is_main_account": is_main,
+                            "seat_type": seat_type,
+                            "seat_type_raw": raw_seat,
                             "type": "member",
                         }
                     )
@@ -3242,10 +3325,18 @@ def get_team_members():
                             "role": inv.get("role", ""),
                             "user_id": inv.get("id", ""),
                             "is_local": email in local_emails,
+                            "is_main_account": _is_main_account_email(email),
+                            "seat_type": "invite",
+                            "seat_type_raw": "",
                             "type": "invite",
                         }
                     )
-                return {"members": result, "total": len(members), "invites": len(invites)}
+                return {
+                    "members": result,
+                    "total": len(members),
+                    "invites": len(invites),
+                    "seat_summary": seat_summary,
+                }
             finally:
                 chatgpt.stop()
 
