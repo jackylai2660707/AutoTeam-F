@@ -63,10 +63,34 @@ def upload_to_cpa(filepath):
 
     if resp.status_code == 200:
         logger.info("[CPA] 已上传: %s", filepath.name)
+        ensure_cpa_file_enabled(filepath.name)
         return True
     else:
         logger.error("[CPA] 上传失败: %d %s", resp.status_code, resp.text[:200])
         return False
+
+
+def ensure_cpa_file_enabled(name):
+    """Ensure an uploaded CPA auth file is available for routing."""
+    try:
+        resp = requests.patch(
+            f"{CPA_URL}/v0/management/auth-files/status",
+            headers={**_headers(), "Content-Type": "application/json"},
+            json={"name": name, "disabled": False},
+            timeout=10,
+        )
+    except requests.RequestException as exc:
+        logger.warning("[CPA] 启用远端认证文件失败: %s (%s)", name, exc)
+        return False
+
+    if resp.status_code == 200:
+        logger.info("[CPA] 已启用远端认证文件: %s", name)
+        return True
+    if resp.status_code == 404:
+        logger.warning("[CPA] 远端不支持 auth-files/status，跳过启用: %s", name)
+        return False
+    logger.warning("[CPA] 启用远端认证文件失败: %s -> HTTP %d %s", name, resp.status_code, resp.text[:200])
+    return False
 
 
 def _backup_cpa_file(name, content, *, reason="remote_delete"):
