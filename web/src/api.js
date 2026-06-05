@@ -100,6 +100,7 @@ export const api = {
 
   getAutoCheckConfig: () => request('GET', '/config/auto-check'),
   setAutoCheckConfig: (cfg) => request('PUT', '/config/auto-check', cfg),
+  runAutoCheckNow: () => request('POST', '/config/auto-check/run'),
 
   getRegisterDomain: () => request('GET', '/config/register-domain'),
   setRegisterDomain: (domain, verify = true) => request('PUT', '/config/register-domain', { domain, verify }),

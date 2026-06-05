@@ -3861,9 +3861,50 @@ _auto_check_config = {
     "target_seats": _DEFAULT_TARGET_SEATS,
     "threshold": _DEFAULT_THRESHOLD,
     "min_low": _DEFAULT_MIN_LOW,
+    "startup_check_enabled": True,
+    "startup_delay": 30,
 }
 _auto_check_stop = threading.Event()
 _auto_check_restart = threading.Event()  # 配置变更时通知线程重启
+_auto_check_run_now = threading.Event()  # 手动/启动期唤醒线程立即跑一轮
+
+
+def _coerce_auto_check_config(raw: dict | None = None) -> dict:
+    raw = raw if isinstance(raw, dict) else {}
+    cfg = {
+        "interval": max(60, int(raw.get("interval", _DEFAULT_INTERVAL) or _DEFAULT_INTERVAL)),
+        "target_seats": max(1, min(3, int(raw.get("target_seats", _DEFAULT_TARGET_SEATS) or _DEFAULT_TARGET_SEATS))),
+        "threshold": max(1, min(100, int(raw.get("threshold", _DEFAULT_THRESHOLD) or _DEFAULT_THRESHOLD))),
+        "min_low": max(1, int(raw.get("min_low", _DEFAULT_MIN_LOW) or _DEFAULT_MIN_LOW)),
+        "startup_check_enabled": bool(raw.get("startup_check_enabled", True)),
+        "startup_delay": max(0, min(3600, int(raw.get("startup_delay", 30) or 0))),
+    }
+    return cfg
+
+
+def _load_persisted_auto_check_config() -> dict:
+    try:
+        from autoteam.runtime_config import get
+
+        stored = get("auto_check_config", {}) or {}
+    except Exception as exc:
+        logger.warning("[巡检] 读取持久化配置失败，使用默认值: %s", exc)
+        stored = {}
+    return _coerce_auto_check_config({**_auto_check_config, **stored})
+
+
+def _save_persisted_auto_check_config(cfg: dict) -> dict:
+    coerced = _coerce_auto_check_config(cfg)
+    try:
+        from autoteam.runtime_config import set_value
+
+        set_value("auto_check_config", coerced)
+    except Exception as exc:
+        logger.warning("[巡检] 持久化配置失败，仅当前进程生效: %s", exc)
+    return coerced
+
+
+_auto_check_config.update(_load_persisted_auto_check_config())
 
 
 def _resolve_auto_check_target_seats(cfg: dict[str, int | bool]) -> int:
@@ -4057,24 +4098,55 @@ def _collect_cpa_credential_gate() -> dict:
     }
 
 
+def _wait_for_auto_check(deadline_seconds: int | float) -> str:
+    """Wait for interval, config restart, run-now signal, or shutdown."""
+    deadline_seconds = max(0.0, float(deadline_seconds or 0))
+    if deadline_seconds <= 0:
+        return "elapsed"
+    deadline = time.time() + deadline_seconds
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return "elapsed"
+        if _auto_check_stop.wait(min(1.0, remaining)):
+            return "stop"
+        if _auto_check_run_now.is_set():
+            return "run_now"
+        if _auto_check_restart.is_set():
+            return "restart"
+
+
 def _auto_check_loop():
     """后台巡检线程：定期检查额度，多个账号低于阈值时自动轮转"""
     from autoteam.accounts import STATUS_ACTIVE, is_account_disabled, load_accounts
 
+    first_iteration = True
     while not _auto_check_stop.is_set():
         cfg = _auto_check_config
+        if first_iteration and cfg.get("startup_check_enabled", True):
+            wait_seconds = int(cfg.get("startup_delay", 30) or 0)
+            wait_label = "启动首检"
+        else:
+            wait_seconds = int(cfg["interval"])
+            wait_label = "下一轮检查"
         logger.info(
-            "[巡检] 等待 %d 分钟后执行下一轮检查（阈值: %d%%, 模式: 任意失效立即 1v1 替换）",
-            cfg["interval"] // 60,
+            "[巡检] 等待 %d 秒后执行%s（阈值: %d%%, 模式: 任意失效立即 1v1 替换）",
+            wait_seconds,
+            wait_label,
             cfg["threshold"],
         )
 
-        # 等待 interval 秒，期间可被 restart 或 stop 唤醒
+        # 等待 interval 秒，期间可被 restart/run-now/stop 唤醒。
         _auto_check_restart.clear()
-        if _auto_check_stop.wait(cfg["interval"]):
+        wake_reason = _wait_for_auto_check(wait_seconds)
+        if wake_reason == "stop":
             break
-        if _auto_check_restart.is_set():
+        if wake_reason == "restart" and not _auto_check_run_now.is_set():
             continue  # 配置变更，跳到下一轮重新读取配置
+        if _auto_check_run_now.is_set():
+            logger.info("[巡检] 收到立即巡检信号，开始执行")
+            _auto_check_run_now.clear()
+        first_iteration = False
 
         if _playwright_lock.locked() or _current_task_id:
             logger.info("[巡检] 有任务正在执行，跳过本轮自动巡检昂贵探测")
@@ -4458,6 +4530,8 @@ class AutoCheckConfig(BaseModel):
     target_seats: int = 3  # 自动巡检目标 Team seat 数，最多 1 母 + 2 子
     threshold: int = 10  # 额度阈值（%）
     min_low: int = 2  # 触发轮转的最少账号数
+    startup_check_enabled: bool = True  # 服务启动后是否快速跑首轮自愈巡检
+    startup_delay: int = 30  # 启动后首轮巡检延迟（秒）
 
 
 @app.get("/api/config/auto-check")
@@ -4469,18 +4543,36 @@ def get_auto_check_config():
 @app.put("/api/config/auto-check")
 def set_auto_check_config(cfg: AutoCheckConfig):
     """修改巡检配置（运行时生效）"""
-    _auto_check_config["interval"] = max(60, cfg.interval)  # 最少 1 分钟
-    _auto_check_config["target_seats"] = max(1, min(3, cfg.target_seats))
-    _auto_check_config["threshold"] = max(1, min(100, cfg.threshold))
-    _auto_check_config["min_low"] = max(1, cfg.min_low)
+    updated = _save_persisted_auto_check_config(cfg.model_dump())
+    _auto_check_config.update(updated)
     _auto_check_restart.set()  # 唤醒巡检线程，立即应用新配置
     logger.info(
-        "[巡检] 配置已更新: 间隔=%ds 目标 seat=%d 阈值=%d%%（min_low 已废弃,任意失效立即 1v1 替换）",
+        "[巡检] 配置已更新: 间隔=%ds 目标 seat=%d 阈值=%d%% 启动首检=%s/%ss（min_low 已废弃,任意失效立即 1v1 替换）",
         _auto_check_config["interval"],
         _auto_check_config["target_seats"],
         _auto_check_config["threshold"],
+        _auto_check_config["startup_check_enabled"],
+        _auto_check_config["startup_delay"],
     )
     return _auto_check_config.copy()
+
+
+@app.post("/api/config/auto-check/run", status_code=202)
+def run_auto_check_now():
+    """唤醒后台巡检线程立即按自愈逻辑跑一轮。"""
+    if _playwright_lock.locked() or _current_task_id:
+        return {
+            "scheduled": False,
+            "reason": "task_running",
+            "message": "当前已有任务执行中，本次立即巡检未排队",
+        }
+    _auto_check_run_now.set()
+    _auto_check_restart.set()
+    logger.info("[巡检] 已收到立即巡检请求")
+    return {
+        "scheduled": True,
+        "message": "已唤醒后台巡检线程，将按自愈逻辑立即检查 Team/OAuth/CPA/额度",
+    }
 
 
 # Round 7 P2.4 — startup/shutdown 已迁移到顶部 app_lifespan,这里不再重复挂 handler。

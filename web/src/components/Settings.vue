@@ -332,11 +332,14 @@
 
     <div class="glass rounded-lg p-5">
       <div class="flex items-center justify-between mb-4">
-        <h2 class="text-lg font-semibold text-ink-950">巡检设置</h2>
+        <div>
+          <h2 class="text-lg font-semibold text-ink-950">自动驾驶巡检</h2>
+          <p class="text-sm text-ink-500 mt-1">自动补满 Team、修复 OAuth、同步 CPA，并在额度不足时轮替。</p>
+        </div>
         <span v-if="saved" class="text-xs text-emerald-700 transition">已保存</span>
       </div>
 
-      <div class="grid grid-cols-1 sm:grid-cols-4 gap-4">
+      <div class="grid grid-cols-1 sm:grid-cols-5 gap-4">
         <div>
           <label class="block text-sm text-ink-500 mb-1">巡检间隔</label>
           <div class="flex items-center gap-2">
@@ -369,16 +372,37 @@
             <span class="text-sm text-gray-500 shrink-0">个</span>
           </div>
         </div>
+        <div>
+          <label class="block text-sm text-ink-500 mb-1">启动首检</label>
+          <div class="flex items-center gap-2">
+            <input v-model.number="form.startup_delay" type="number" min="0" max="3600"
+              :disabled="!form.startup_check_enabled"
+              class="w-full px-3 py-2 bg-surface-hover border border-hairline rounded-lg text-sm text-ink-950 focus:outline-none focus:border-indigo-500 disabled:opacity-50" />
+            <span class="text-sm text-gray-500 shrink-0">秒</span>
+          </div>
+        </div>
       </div>
 
       <div class="mt-3 flex items-center justify-between gap-3">
-        <p class="text-xs text-gray-500">
-          每 {{ form.interval }} 分钟检查一次，目标 {{ form.target_seats }} 席（1 母 + 最多 2 子），{{ form.min_low }} 个以上账号剩余低于 {{ form.threshold }}% 时自动轮转
-        </p>
-        <button @click="save" :disabled="saving"
-          class="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-on-accent text-sm rounded-lg transition disabled:opacity-50">
-          {{ saving ? '保存中...' : '保存' }}
-        </button>
+        <div class="space-y-2">
+          <label class="inline-flex items-center gap-2 text-xs text-ink-600">
+            <input v-model="form.startup_check_enabled" type="checkbox" class="rounded border-hairline" />
+            服务启动后自动首检
+          </label>
+          <p class="text-xs text-gray-500">
+            每 {{ form.interval }} 分钟检查一次，目标 {{ form.target_seats }} 席（1 母 + 最多 2 子）。任一子号 OAuth 失效、CPA 可用凭证不足、Team 未满或额度低于 {{ form.threshold }}% 时自动处理。
+          </p>
+        </div>
+        <div class="flex items-center gap-2 shrink-0">
+          <button @click="runNow" :disabled="saving || runningNow"
+            class="px-4 py-1.5 bg-teal-700 hover:bg-teal-600 text-on-accent text-sm rounded-lg transition disabled:opacity-50">
+            {{ runningNow ? '唤醒中...' : '立即巡检' }}
+          </button>
+          <button @click="save" :disabled="saving"
+            class="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-on-accent text-sm rounded-lg transition disabled:opacity-50">
+            {{ saving ? '保存中...' : '保存' }}
+          </button>
+        </div>
       </div>
     </div>
 
@@ -532,9 +556,17 @@ async function onReloadMasterHealth() {
   finally { setTimeout(() => { masterHealthLoading.value = false }, 1200) }
 }
 
-const form = ref({ interval: 5, target_seats: 3, threshold: 10, min_low: 2 })
+const form = ref({
+  interval: 5,
+  target_seats: 3,
+  threshold: 10,
+  min_low: 2,
+  startup_check_enabled: true,
+  startup_delay: 30,
+})
 const saving = ref(false)
 const saved = ref(false)
+const runningNow = ref(false)
 
 const email = ref('')
 const sessionEmail = ref('')
@@ -646,6 +678,8 @@ onMounted(async () => {
       target_seats: cfg.target_seats ?? 3,
       threshold: cfg.threshold,
       min_low: cfg.min_low,
+      startup_check_enabled: cfg.startup_check_enabled ?? true,
+      startup_delay: cfg.startup_delay ?? 30,
     }
   } catch {}
   try {
@@ -846,12 +880,16 @@ async function save() {
       target_seats: form.value.target_seats,
       threshold: form.value.threshold,
       min_low: form.value.min_low,
+      startup_check_enabled: form.value.startup_check_enabled,
+      startup_delay: form.value.startup_delay,
     })
     form.value = {
       interval: Math.round(cfg.interval / 60),
       target_seats: cfg.target_seats ?? 3,
       threshold: cfg.threshold,
       min_low: cfg.min_low,
+      startup_check_enabled: cfg.startup_check_enabled ?? true,
+      startup_delay: cfg.startup_delay ?? 30,
     }
     saved.value = true
     setTimeout(() => { saved.value = false }, 3000)
@@ -859,6 +897,19 @@ async function save() {
     console.error('保存失败:', e)
   } finally {
     saving.value = false
+  }
+}
+
+async function runNow() {
+  runningNow.value = true
+  try {
+    const resp = await api.runAutoCheckNow()
+    setMessage(resp.message || '已唤醒自动巡检')
+    emit('refresh')
+  } catch (e) {
+    setMessage(e.message || '立即巡检失败', 'error')
+  } finally {
+    runningNow.value = false
   }
 }
 
