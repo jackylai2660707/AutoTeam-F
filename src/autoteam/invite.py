@@ -246,6 +246,57 @@ def find_and_click(page, selectors, label="元素", timeout=3000):
     return False
 
 
+def _click_finish_account_button(page, timeout=8000):
+    selectors = [
+        'button:has-text("完成帐户创建")',
+        'button:has-text("Finish creating account")',
+        'button:has-text("Complete")',
+        'button:has-text("Continue")',
+        'button:has-text("Agree")',
+        'button[type="submit"]',
+    ]
+    deadline = time.time() + max(1, timeout / 1000)
+    while time.time() < deadline:
+        for sel in selectors:
+            try:
+                loc = page.locator(sel).first
+                if not loc.is_visible(timeout=300):
+                    continue
+                if not loc.is_enabled(timeout=300):
+                    continue
+                loc.scroll_into_view_if_needed(timeout=1000)
+                try:
+                    loc.click(timeout=2500)
+                except Exception as normal_click_exc:
+                    logger.debug("[注册] 完成按钮普通点击失败，改用 force: %s", normal_click_exc)
+                    loc.click(force=True, timeout=2500)
+                try:
+                    box = loc.bounding_box()
+                    if box:
+                        page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+                except Exception as mouse_exc:
+                    logger.debug("[注册] 完成按钮 mouse click fallback 失败: %s", mouse_exc)
+                try:
+                    loc.evaluate(
+                        """(button) => {
+                            button.click();
+                            const form = button.closest('form');
+                            if (form && typeof form.requestSubmit === 'function') {
+                                form.requestSubmit(button);
+                            }
+                        }"""
+                    )
+                except Exception as js_exc:
+                    logger.debug("[注册] 完成按钮 JS submit fallback 失败: %s", js_exc)
+                logger.info("[注册] 已点击完成按钮: %s", sel)
+                return True
+            except Exception:
+                continue
+        time.sleep(0.3)
+    logger.warning("[注册] 未找到可点击的完成按钮")
+    return False
+
+
 def find_visible(page, selectors, label="元素", timeout=3000):
     for sel in selectors:
         try:
@@ -326,6 +377,214 @@ def _visible_input_summary(page, limit=8):
         if len(summary) >= limit:
             break
     return summary
+
+
+def _accept_required_profile_terms(page):
+    """Accept mandatory profile consent checkboxes on OpenAI about-you pages."""
+    clicked = 0
+    try:
+        agree_all = page.locator(
+            'label:has-text("I agree to all"), text="I agree to all of the following"'
+        ).first
+        if agree_all.is_visible(timeout=800):
+            agree_all.click(force=True)
+            clicked += 1
+            time.sleep(0.5)
+    except Exception:
+        pass
+
+    for selector in ['input[type="checkbox"]', '[role="checkbox"]']:
+        try:
+            boxes = page.locator(selector).all()
+        except Exception:
+            boxes = []
+        for box in boxes:
+            try:
+                if not box.is_visible(timeout=300):
+                    continue
+                if hasattr(box, "is_checked") and box.is_checked(timeout=300):
+                    continue
+                box.click(force=True)
+                clicked += 1
+                time.sleep(0.15)
+            except Exception:
+                continue
+
+    if clicked:
+        logger.info("[注册] 已勾选个人信息/条款确认项: %d", clicked)
+    return clicked
+
+
+def _fill_invite_profile_fields(page, full_name, age_value, bday):
+    """Fill name plus the current about-you age/birthday variant."""
+    filled_any = False
+    name_input = find_visible(
+        page,
+        [
+            'input[name="name"]',
+            'input[placeholder*="name" i]',
+            'input[id="name"]',
+            'input[placeholder*="全名" i]',
+        ],
+        "名字输入框",
+        timeout=5000,
+    )
+    if name_input:
+        name_input.fill(full_name)
+        filled_any = True
+        time.sleep(0.5)
+
+    month = str(bday["month"]).zfill(2)
+    day = str(bday["day"]).zfill(2)
+    year = str(bday["year"])
+    birthday_value = f"{month}/{day}/{year}"
+
+    birthday_input = find_visible(
+        page,
+        [
+            'input[name*="birth" i]',
+            'input[id*="birth" i]',
+            'input[placeholder*="birth" i]',
+            'input[aria-label*="birth" i]',
+            'input[placeholder*="生日" i]',
+            'input[aria-label*="生日" i]',
+        ],
+        "生日输入框",
+        timeout=1200,
+    )
+    if birthday_input:
+        birthday_input.fill(birthday_value)
+        logger.info("[注册] 填入生日: %s (input)", birthday_value)
+        return True
+
+    spinbuttons = page.locator('[role="spinbutton"]').all()
+    if len(spinbuttons) >= 3:
+        body = _page_excerpt(page, limit=1000).lower()
+        values = [month, day, year] if "birthday" in body else [year, month, day]
+        try:
+            page.locator("text=生日日期").click()
+            time.sleep(0.5)
+        except Exception:
+            pass
+        for sb, val in zip(spinbuttons[:3], values):
+            sb.click(force=True)
+            time.sleep(0.2)
+            try:
+                page.keyboard.press("Control+A")
+                page.keyboard.press("Backspace")
+            except Exception:
+                pass
+            page.keyboard.type(val, delay=80)
+            time.sleep(0.3)
+        logger.info("[注册] 填入生日: %s (spinbutton)", "/".join(values))
+        return True
+
+    age_input = find_visible(
+        page,
+        [
+            'input[name="age"]',
+            'input[id="age"]',
+            'input[placeholder*="age" i]',
+            'input[placeholder*="年龄" i]',
+            'input[type="number"]',
+        ],
+        "年龄输入框",
+        timeout=3000,
+    )
+    if age_input:
+        age_input.fill(age_value)
+        logger.info("[注册] 填入年龄: %s", age_value)
+        return True
+
+    return filled_any
+
+
+def _recover_profile_submit_timeout(page, full_name, age_value, bday, attempts=2):
+    """Retry OpenAI's transient "Operation timed out" page after profile submit."""
+    recovered = False
+    for attempt in range(1, attempts + 1):
+        body = _page_excerpt(page, limit=1200).lower()
+        if "operation timed out" not in body and "oops, an error occurred" not in body:
+            return recovered
+
+        logger.warning("[注册] profile_submit 遇到 OpenAI operation timed out，尝试恢复 %d/%d", attempt, attempts)
+        screenshot(page, f"reg_profile_timeout_{attempt}_before.png")
+        clicked = find_and_click(
+            page,
+            [
+                'button:has-text("Try again")',
+                'button:has-text("Retry")',
+                'button:has-text("再试一次")',
+                'button[type="submit"]',
+            ],
+            "profile 超时重试按钮",
+            timeout=5000,
+        )
+        if not clicked:
+            return recovered
+        recovered = True
+        time.sleep(8)
+        screenshot(page, f"reg_profile_timeout_{attempt}_after.png")
+
+        step = _detect_invite_register_step(page)
+        if step == "about_you":
+            if _fill_invite_profile_fields(page, full_name, age_value, bday):
+                logger.info("[注册] profile 超时恢复后已重新填入身份信息")
+            _accept_required_profile_terms(page)
+            _click_finish_account_button(page)
+            time.sleep(10)
+            screenshot(page, f"reg_profile_timeout_{attempt}_resubmit.png")
+
+    return recovered
+
+
+def _profile_has_transient_error(page):
+    body = _page_excerpt(page, limit=1200).lower()
+    return "operation timed out" in body or "oops, an error occurred" in body
+
+
+def _drive_invite_profile_completion(page, full_name, age_value, bday, attempts=4):
+    """Submit OpenAI's profile page until it leaves about-you or hard-fails."""
+    for attempt in range(1, max(1, int(attempts)) + 1):
+        step = _detect_invite_register_step(page)
+        if step != "about_you" and not _profile_has_transient_error(page):
+            return True
+
+        if _profile_has_transient_error(page):
+            logger.warning("[注册] profile 提交后仍是超时页，先恢复再重试 (%d/%d)", attempt, attempts)
+            if not _recover_profile_submit_timeout(page, full_name, age_value, bday, attempts=1):
+                return False
+        else:
+            if _fill_invite_profile_fields(page, full_name, age_value, bday):
+                logger.info("[注册] profile 已填入身份信息 (%d/%d)", attempt, attempts)
+            _accept_required_profile_terms(page)
+            if not _click_finish_account_button(page):
+                return False
+
+        try:
+            page.keyboard.press("Enter")
+        except Exception:
+            pass
+
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            assert_not_blocked(page, "profile_submit")
+            if _profile_has_transient_error(page):
+                break
+            step = _detect_invite_register_step(page)
+            if step != "about_you":
+                logger.info("[注册] profile 提交后状态: %s | URL: %s", step, page.url)
+                return True
+            time.sleep(0.75)
+
+        if _profile_has_transient_error(page):
+            logger.warning("[注册] profile_submit 遇到 OpenAI operation timed out，准备下一轮恢复")
+            continue
+
+        screenshot(page, f"reg_profile_still_about_you_{attempt}.png")
+        logger.warning("[注册] profile 提交后仍停留 about-you，重试 %d/%d | URL=%s", attempt, attempts, page.url)
+
+    return _detect_invite_register_step(page) != "about_you" and not _profile_has_transient_error(page)
 
 
 def _detect_invite_register_step(page):
@@ -671,72 +930,11 @@ def register_with_invite(page, invite_link, email, mail_client, password=None, s
         age_value,
     )
 
-    # 填写个人信息（全名 + 生日/年龄）
-    name_input = find_visible(
-        page,
-        [
-            'input[name="name"]',
-            'input[placeholder*="name" i]',
-            'input[id="name"]',
-            'input[placeholder*="全名" i]',
-        ],
-        "名字输入框",
-        timeout=5000,
-    )
-
-    if name_input:
-        name_input.fill(full_name)
-        time.sleep(0.5)
-
-    # 自适应：生日日期（spinbutton）或年龄（普通 input）
-    filled_age = False
-    spinbuttons = page.locator('[role="spinbutton"]').all()
-    if len(spinbuttons) >= 3:
-        # 类型 A：React Aria DateField（年/月/日 spinbutton）
-        try:
-            page.locator("text=生日日期").click()
-            time.sleep(0.5)
-        except Exception:
-            pass
-        for sb, val in zip(spinbuttons[:3], [bday["year"], bday["month"], bday["day"]]):
-            sb.click(force=True)
-            time.sleep(0.2)
-            page.keyboard.type(val, delay=80)
-            time.sleep(0.3)
-        logger.info("[注册] 填入生日: %s/%s/%s (spinbutton)", bday["year"], bday["month"], bday["day"])
-        filled_age = True
-    else:
-        # 类型 B：普通年龄数字输入框
-        age_input = find_visible(
-            page,
-            [
-                'input[name="age"]',
-                'input[id="age"]',
-                'input[placeholder*="age" i]',
-                'input[placeholder*="年龄" i]',
-                'input[type="number"]',
-            ],
-            "年龄输入框",
-            timeout=3000,
-        )
-        if age_input:
-            age_input.fill(age_value)
-            logger.info("[注册] 填入年龄: %s", age_value)
-            filled_age = True
-
-    if name_input or filled_age:
-        find_and_click(
-            page,
-            [
-                'button:has-text("完成帐户创建")',
-                'button:has-text("Complete")',
-                'button:has-text("Continue")',
-                'button:has-text("Agree")',
-                'button[type="submit"]',
-            ],
-            "完成按钮",
-        )
-        time.sleep(8)
+    # 填写个人信息（全名 + 生日/年龄）。OpenAI about-you 偶发点击后不提交/
+    # operation timed out，必须在同页多次推进，而不是直接丢弃邮箱。
+    if _detect_invite_register_step(page) == "about_you":
+        _drive_invite_profile_completion(page, full_name, age_value, bday)
+        time.sleep(3)
         screenshot(page, "reg_07_after_profile.png")
         assert_not_blocked(page, "profile_submit")
         _recover_blank_invite_page(page, "after_profile_submit")

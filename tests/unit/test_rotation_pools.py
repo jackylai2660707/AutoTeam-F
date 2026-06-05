@@ -60,3 +60,17 @@ def test_static_proxy_pool_rotates_before_ipv6(monkeypatch, tmp_path):
         "socks5://p1.example:1080",
         "socks5://p1.example:1080",
     )
+
+
+def test_static_authenticated_socks_proxy_uses_playwright_bridge(monkeypatch, tmp_path):
+    _use_runtime_file(monkeypatch, tmp_path)
+    upstream = "socks5://user:pass@proxy.example:1080"
+    monkeypatch.setattr(config, "PLAYWRIGHT_PROXY_URLS", (upstream,), raising=False)
+
+    from autoteam import manager
+
+    monkeypatch.setattr("autoteam.proxy_bridge.get_playwright_proxy_url", lambda url: "socks5://127.0.0.1:45678")
+
+    auth_proxy_url, playwright_proxy_url = manager._ensure_account_ipv6_proxy("a@example.com")
+    assert auth_proxy_url == upstream
+    assert playwright_proxy_url == "socks5://127.0.0.1:45678"

@@ -689,8 +689,16 @@ def _ensure_account_ipv6_proxy(email: str | None) -> tuple[str, str]:
 
         proxy_url = get_next_playwright_proxy_url()
         if proxy_url:
-            logger.info("[ProxyPool] account %s using static proxy %s", email, proxy_url)
-            return proxy_url, proxy_url
+            from autoteam.proxy_bridge import get_playwright_proxy_url, mask_proxy_url
+
+            playwright_proxy_url = get_playwright_proxy_url(proxy_url)
+            logger.info(
+                "[ProxyPool] account %s using static proxy %s (playwright=%s)",
+                email,
+                mask_proxy_url(proxy_url),
+                mask_proxy_url(playwright_proxy_url),
+            )
+            return proxy_url, playwright_proxy_url
     except Exception as exc:
         logger.warning("[ProxyPool] static proxy pool unavailable for %s, falling back to IPv6/direct: %s", email, exc)
 
