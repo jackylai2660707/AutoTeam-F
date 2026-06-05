@@ -3134,7 +3134,13 @@ def get_register_failures_api(limit: int = 50):
 def get_register_domain_api():
     """读取当前子号注册使用的 CloudMail 域名池。"""
     from autoteam.config import CLOUDMAIL_DOMAIN, CLOUDMAIL_DOMAINS
-    from autoteam.runtime_config import get, get_register_domain, get_register_domains
+    from autoteam.runtime_config import (
+        get,
+        get_register_domain,
+        get_register_domains,
+        get_register_random_subdomain_prefix,
+        register_random_subdomain_enabled,
+    )
 
     override = (get("register_domain") or "").strip()
     domains_override = get("register_domains") or []
@@ -3145,6 +3151,11 @@ def get_register_domain_api():
         "domains_override": domains_override,
         "env_default": (CLOUDMAIL_DOMAIN or "").lstrip("@").strip(),
         "env_defaults": [str(d).lstrip("@").strip() for d in CLOUDMAIL_DOMAINS],
+        "random_subdomain": {
+            "enabled": register_random_subdomain_enabled(),
+            "prefix": get_register_random_subdomain_prefix(),
+            "fallback_to_root": True,
+        },
     }
 
 

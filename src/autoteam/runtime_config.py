@@ -10,6 +10,7 @@ import logging
 import os
 import threading
 import time
+import uuid
 from pathlib import Path
 
 from autoteam.textio import read_text, write_text
@@ -142,6 +143,42 @@ def get_next_register_domain() -> str:
         data["_register_domain_index"] = index
         _save(data)
         return domains[index]
+
+
+def register_random_subdomain_enabled() -> bool:
+    raw = get("register_random_subdomain_enabled", os.environ.get("REGISTER_RANDOM_SUBDOMAIN_ENABLED", "0"))
+    if isinstance(raw, bool):
+        return raw
+    return str(raw or "").strip().lower() in {"1", "true", "yes", "on", "enabled"}
+
+
+def get_register_random_subdomain_prefix() -> str:
+    raw = get("register_random_subdomain_prefix", os.environ.get("REGISTER_RANDOM_SUBDOMAIN_PREFIX", "at"))
+    prefix = "".join(ch for ch in str(raw or "at").lower() if ch.isalnum())
+    return (prefix or "at")[:16]
+
+
+def with_random_register_subdomain(domain: str) -> str:
+    """Return a random subdomain under the selected register domain."""
+    domain = _clean_domain(domain)
+    if not domain or not register_random_subdomain_enabled():
+        return domain
+    label = f"{get_register_random_subdomain_prefix()}{uuid.uuid4().hex[:10]}"
+    return f"{label}.{domain}"
+
+
+def set_register_random_subdomain(enabled: bool, prefix: str | None = None) -> dict:
+    with _LOCK:
+        data = _load()
+        data["register_random_subdomain_enabled"] = bool(enabled)
+        if prefix is not None:
+            cleaned_prefix = "".join(ch for ch in str(prefix).lower() if ch.isalnum())[:16] or "at"
+            data["register_random_subdomain_prefix"] = cleaned_prefix
+        _save(data)
+        return {
+            "enabled": bool(data.get("register_random_subdomain_enabled")),
+            "prefix": data.get("register_random_subdomain_prefix", get_register_random_subdomain_prefix()),
+        }
 
 
 def set_register_domain(domain):

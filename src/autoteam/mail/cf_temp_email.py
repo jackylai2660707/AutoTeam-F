@@ -134,12 +134,17 @@ class CfTempEmailClient(MailProvider):
         2. runtime_config/env 中的注册域名池 round-robin
         3. 环境变量 CLOUDMAIL_DOMAIN
         """
+        base_domain = ""
+        randomized_domain = ""
         if domain:
-            domain = domain.lstrip("@").strip()
+            base_domain = domain.lstrip("@").strip()
+            domain = base_domain
         else:
-            from autoteam.runtime_config import get_next_register_domain
+            from autoteam.runtime_config import get_next_register_domain, with_random_register_subdomain
 
-            domain = get_next_register_domain()
+            base_domain = get_next_register_domain()
+            randomized_domain = with_random_register_subdomain(base_domain)
+            domain = randomized_domain or base_domain
         if not domain:
             raise Exception("创建邮箱失败: 未配置注册域名")
 
@@ -148,6 +153,24 @@ class CfTempEmailClient(MailProvider):
             "/admin/new_address",
             {"name": cleaned, "domain": domain, "enablePrefix": False},
         )
+        if (
+            r.status_code != 200
+            and randomized_domain
+            and base_domain
+            and randomized_domain != base_domain
+            and "invalid domain" in (r.text or "").lower()
+        ):
+            logger.warning(
+                "[CloudMail] 随机子域名不可用，回退轮询根域名: %s -> %s (%s)",
+                randomized_domain,
+                base_domain,
+                (r.text or "")[:120],
+            )
+            domain = base_domain
+            r = self._admin_post(
+                "/admin/new_address",
+                {"name": cleaned, "domain": domain, "enablePrefix": False},
+            )
         if r.status_code != 200:
             raise Exception(f"创建邮箱失败: HTTP {r.status_code} {(r.text or '')[:200]}")
 
