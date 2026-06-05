@@ -425,6 +425,14 @@ def _normalize_rotation_setup_values(data: dict) -> None:
     )
 
 
+def _normalize_mail_setup_values(data: dict) -> None:
+    provider = (data.get("MAIL_PROVIDER") or "cf_temp_email").strip().lower()
+    if provider in ("cf_temp_email", "cloudflare_temp_email"):
+        from autoteam.mail.cf_temp_email import normalize_cloudflare_temp_email_base_url
+
+        data["CLOUDMAIL_BASE_URL"] = normalize_cloudflare_temp_email_base_url(data.get("CLOUDMAIL_BASE_URL") or "")
+
+
 @app.get("/api/setup/status")
 def get_setup_status():
     """检查配置是否完整 — SPEC-1 §3.6:按 provider 动态标 optional。"""
@@ -463,6 +471,7 @@ def post_setup_save(config: SetupConfig):
         data["API_KEY"] = _secrets.token_urlsafe(24)
     try:
         _normalize_rotation_setup_values(data)
+        _normalize_mail_setup_values(data)
     except ValueError as exc:
         return JSONResponse(status_code=400, content={"message": str(exc), "api_key": data["API_KEY"]})
 
@@ -1159,7 +1168,8 @@ class TeamMemberRemoveParams(BaseModel):
 
 
 class RegisterDomainParams(BaseModel):
-    domain: str
+    domain: str = ""
+    domains: list[str] | str | None = None
     verify: bool = True  # 默认写入前试探一次 CloudMail 是否接受该域
 
 
@@ -3122,15 +3132,19 @@ def get_register_failures_api(limit: int = 50):
 
 @app.get("/api/config/register-domain")
 def get_register_domain_api():
-    """读取当前子号注册使用的 CloudMail 域名。"""
-    from autoteam.config import CLOUDMAIL_DOMAIN
-    from autoteam.runtime_config import get, get_register_domain
+    """读取当前子号注册使用的 CloudMail 域名池。"""
+    from autoteam.config import CLOUDMAIL_DOMAIN, CLOUDMAIL_DOMAINS
+    from autoteam.runtime_config import get, get_register_domain, get_register_domains
 
     override = (get("register_domain") or "").strip()
+    domains_override = get("register_domains") or []
     return {
         "domain": get_register_domain(),
+        "domains": get_register_domains(),
         "override": override,
+        "domains_override": domains_override,
         "env_default": (CLOUDMAIL_DOMAIN or "").lstrip("@").strip(),
+        "env_defaults": [str(d).lstrip("@").strip() for d in CLOUDMAIL_DOMAINS],
     }
 
 
@@ -3146,41 +3160,56 @@ def put_register_domain_api(params: RegisterDomainParams):
     回收失败 leaked_probe 透传)。改 probe 时需同步检查本函数。
     """
     from autoteam.cloudmail import CloudMailClient
-    from autoteam.runtime_config import set_register_domain
+    from autoteam.runtime_config import _split_csvish, set_register_domains
 
-    cleaned = (params.domain or "").strip().lstrip("@").strip()
-    if not cleaned:
+    raw_domains = params.domains if params.domains is not None else params.domain
+    cleaned_domains = []
+    seen = set()
+    for item in _split_csvish(raw_domains):
+        cleaned = (item or "").strip().lstrip("@").strip()
+        key = cleaned.lower()
+        if cleaned and key not in seen:
+            cleaned_domains.append(cleaned)
+            seen.add(key)
+
+    if not cleaned_domains:
         raise HTTPException(status_code=400, detail="域名不能为空")
 
-    leaked_probe = None
+    leaked_probes = []
     if params.verify:
-        probe_prefix = f"probe{int(time.time())}"
-        acct_id = None
-        probe_email = None
+        client = CloudMailClient()
         try:
-            client = CloudMailClient()
             client.login()
-            acct_id, probe_email = client.create_temp_email(prefix=probe_prefix, domain=cleaned)
         except Exception as exc:
-            # CloudMail 返回 "Invalid domain" 等错误直接透传
-            raise HTTPException(status_code=400, detail=f"域名验证失败: {exc}") from exc
-        # 探测地址用完立即回收;删除失败也要让前端看到,否则 CloudMail 会积压僵尸地址
-        try:
-            if acct_id is not None:
-                client.delete_account(acct_id)
-        except Exception as exc:
-            logger.warning("[config] 删除域名探测邮箱失败 (%s, id=%s): %s", probe_email, acct_id, exc)
-            leaked_probe = {"email": probe_email, "acct_id": acct_id, "error": str(exc)}
+            raise HTTPException(status_code=400, detail=f"CloudMail 登录失败: {exc}") from exc
+        for cleaned in cleaned_domains:
+            probe_prefix = f"probe{int(time.time())}"
+            acct_id = None
+            probe_email = None
+            try:
+                acct_id, probe_email = client.create_temp_email(prefix=probe_prefix, domain=cleaned)
+            except Exception as exc:
+                # CloudMail 返回 "Invalid domain" 等错误直接透传
+                raise HTTPException(status_code=400, detail=f"域名 @{cleaned} 验证失败: {exc}") from exc
+            # 探测地址用完立即回收;删除失败也要让前端看到,否则 CloudMail 会积压僵尸地址
+            try:
+                if acct_id is not None:
+                    client.delete_account(acct_id)
+            except Exception as exc:
+                logger.warning("[config] 删除域名探测邮箱失败 (%s, id=%s): %s", probe_email, acct_id, exc)
+                leaked_probes.append({"email": probe_email, "acct_id": acct_id, "error": str(exc)})
 
-    set_register_domain(cleaned)
-    logger.info("[config] register_domain 已切换为 @%s", cleaned)
-    resp = {"message": f"注册域名已切换为 @{cleaned}", "domain": cleaned}
-    if leaked_probe:
-        resp["warning"] = (
-            f"域名已保存,但探测邮箱 {leaked_probe['email']} 回收失败,请手动在 CloudMail 删除"
-            f" (id={leaked_probe['acct_id']}): {leaked_probe['error']}"
-        )
-        resp["leaked_probe"] = leaked_probe
+    saved_domains = set_register_domains(cleaned_domains)
+    logger.info("[config] register_domains 已切换为 %s", ", ".join(f"@{d}" for d in saved_domains))
+    resp = {
+        "message": "注册域名池已保存: " + ", ".join(f"@{d}" for d in saved_domains),
+        "domain": saved_domains[0] if saved_domains else "",
+        "domains": saved_domains,
+    }
+    if leaked_probes:
+        resp["warning"] = f"域名已保存,但有 {len(leaked_probes)} 个探测邮箱回收失败,请手动在 CloudMail 删除"
+        resp["leaked_probes"] = leaked_probes
+        resp["leaked_probe"] = leaked_probes[0]
     return resp
 
 

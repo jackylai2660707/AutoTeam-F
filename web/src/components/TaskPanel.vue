@@ -77,18 +77,23 @@
       </div>
     </div>
 
-    <!-- 注册域名切换(仅 pool 模式可见) -->
+    <!-- 注册域名池切换(仅 pool 模式可见) -->
     <div v-if="mode === 'pool'"
-      class="mt-5 p-3 rounded-lg border border-hairline bg-ink-50 flex flex-wrap items-center gap-2 text-sm">
-      <span class="text-[10px] uppercase tracking-widest text-ink-500 font-semibold mr-1">注册域名</span>
-      <span class="text-ink-400">@</span>
-      <input v-model="domainInput" type="text" placeholder="your-domain.com"
-        class="flex-1 min-w-[180px] px-3 py-1.5 bg-surface border border-hairline rounded-lg text-ink-950 text-sm font-mono focus-ring transition" />
-      <AtButton variant="primary" size="sm" :loading="domainBusy" :disabled="!domainInput" @click="saveDomain">
-        保存并验证
-      </AtButton>
-      <span v-if="currentDomain" class="text-[11px] text-ink-500 font-mono">当前: @{{ currentDomain }}</span>
-      <span v-if="domainMsg" class="ml-1 text-[11px] font-medium" :class="domainMsgOk ? 'text-emerald-700' : 'text-rose-700'">{{ domainMsg }}</span>
+      class="mt-5 p-3 rounded-lg border border-hairline bg-ink-50 text-sm">
+      <div class="flex flex-wrap items-center gap-2">
+        <span class="text-[10px] uppercase tracking-widest text-ink-500 font-semibold mr-1">注册域名池</span>
+        <textarea v-model="domainInput" rows="2" placeholder="beehivesmacau.dpdns.org, new-domain.example"
+          class="flex-1 min-w-[220px] px-3 py-1.5 bg-surface border border-hairline rounded-lg text-ink-950 text-sm font-mono focus-ring transition" />
+        <AtButton variant="primary" size="sm" :loading="domainBusy" :disabled="!domainInput.trim()" @click="saveDomain">
+          保存并逐个验证
+        </AtButton>
+      </div>
+      <div class="mt-2 flex flex-wrap items-center gap-2">
+        <span v-if="currentDomains.length" class="text-[11px] text-ink-500 font-mono">
+          当前: {{ currentDomains.map(d => '@' + d).join(', ') }}
+        </span>
+        <span v-if="domainMsg" class="text-[11px] font-medium" :class="domainMsgOk ? 'text-emerald-700' : 'text-rose-700'">{{ domainMsg }}</span>
+      </div>
     </div>
 
     <!-- 参数输入 -->
@@ -233,6 +238,7 @@ async function cancelTask() {
 
 const domainInput = ref('')
 const currentDomain = ref('')
+const currentDomains = ref([])
 const domainBusy = ref(false)
 const domainMsg = ref('')
 const domainMsgOk = ref(false)
@@ -241,7 +247,8 @@ async function loadDomain() {
   try {
     const d = await api.getRegisterDomain()
     currentDomain.value = d.domain || ''
-    if (!domainInput.value) domainInput.value = d.domain || ''
+    currentDomains.value = d.domains || (d.domain ? [d.domain] : [])
+    if (!domainInput.value) domainInput.value = currentDomains.value.join(', ')
   } catch (e) {
     domainMsg.value = `读取失败: ${e.message}`
     domainMsgOk.value = false
@@ -249,12 +256,18 @@ async function loadDomain() {
 }
 
 async function saveDomain() {
-  if (!domainInput.value) return
+  if (!domainInput.value.trim()) return
   domainBusy.value = true
   domainMsg.value = ''
   try {
-    const r = await api.setRegisterDomain(domainInput.value.replace(/^@/, '').trim(), true)
+    const domains = domainInput.value
+      .split(/[\s,;]+/)
+      .map(d => d.replace(/^@/, '').trim())
+      .filter(Boolean)
+    const r = await api.setRegisterDomains(domains, true)
     currentDomain.value = r.domain || ''
+    currentDomains.value = r.domains || (r.domain ? [r.domain] : domains)
+    domainInput.value = currentDomains.value.join(', ')
     domainMsg.value = r.message || '已保存'
     domainMsgOk.value = true
   } catch (e) {

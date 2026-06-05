@@ -31,6 +31,14 @@ logger = logging.getLogger(__name__)
 PROBE_TIMEOUT = 5  # 秒;每个 HTTP 调用上限
 
 
+def _normalize_cf_temp_email_base_url(value: str) -> str:
+    """cf_temp_email 用户常复制后台页 /admin；API base 需要是其父路径。"""
+    base = (value or "").strip().rstrip("/")
+    if base.lower().endswith("/admin"):
+        base = base[:-6].rstrip("/")
+    return base
+
+
 # ----------------------------------------------------------------- error codes
 
 
@@ -124,6 +132,8 @@ def probe_fingerprint(base_url: str, expected_provider: str) -> ProbeResult:
     若 expected_provider 与 detected 不一致,返 PROVIDER_MISMATCH。
     """
     base = base_url.rstrip("/")
+    if expected_provider in ("cf_temp_email", "cloudflare_temp_email"):
+        base = _normalize_cf_temp_email_base_url(base)
 
     # 探测 1: /setting/websiteConfig (maillab)
     detected = "unknown"
@@ -153,7 +163,7 @@ def probe_fingerprint(base_url: str, expected_provider: str) -> ProbeResult:
 
     # 若 detected 还不是 maillab,尝试 cf_temp_email 探测
     if detected != "maillab":
-        r_admin = _safe_get(f"{base}/admin/address")
+        r_admin = _safe_get(f"{base}/admin/address", params={"limit": 1, "offset": 0})
         if r_admin is not None and r_admin.status_code in (200, 401, 403):
             if r_admin.status_code == 200:
                 try:
@@ -174,7 +184,7 @@ def probe_fingerprint(base_url: str, expected_provider: str) -> ProbeResult:
             step="fingerprint",
             error_code="ROUTE_NOT_FOUND",
             message=f"base_url {base} 既无 /setting/websiteConfig 也无 /admin/address 路由",
-            hint="检查地址拼写。maillab 通常无 /api 前缀;cf_temp_email 通常带 /api",
+            hint="检查地址拼写。cf_temp_email 可填站点根路径或 /admin 后台地址；maillab 通常无 /api 前缀",
             detected_provider=detected,
         )
 
@@ -219,11 +229,17 @@ def probe_credentials(
     maillab:POST /login body `{email, password}` → JWT
     """
     base = base_url.rstrip("/")
+    if provider in ("cf_temp_email", "cloudflare_temp_email"):
+        base = _normalize_cf_temp_email_base_url(base)
 
     if provider in ("cf_temp_email", "cloudflare_temp_email"):
         if not admin_password:
             raise ProbeError("UNAUTHORIZED", "cf_temp_email 凭据校验需要 admin_password", "填写 CLOUDMAIL_PASSWORD")
-        r = _safe_get(f"{base}/admin/address", headers={"x-admin-auth": admin_password})
+        r = _safe_get(
+            f"{base}/admin/address",
+            headers={"x-admin-auth": admin_password},
+            params={"limit": 1, "offset": 0},
+        )
         if r is None:
             raise ProbeError("NETWORK", "凭据校验请求未返回")
         if r.status_code in (401, 403):
@@ -331,6 +347,8 @@ def probe_domain_ownership(
     maillab:若未提供 bearer_token,用 username/password 重 login 一次拿 token(后端无状态决策)
     """
     base = base_url.rstrip("/")
+    if provider in ("cf_temp_email", "cloudflare_temp_email"):
+        base = _normalize_cf_temp_email_base_url(base)
     domain_clean = (domain or "").strip().lstrip("@")
     if not domain_clean:
         raise ProbeError("EMPTY_DOMAIN_LIST", "domain 不能为空", "填写一个有效域名")
@@ -364,9 +382,8 @@ def probe_domain_ownership(
         leaked_probe = None
         if address_id is not None:
             del_r = _safe_delete(
-                f"{base}/admin/delete_address",
+                f"{base}/admin/delete_address/{address_id}",
                 headers={"x-admin-auth": admin_password},
-                params={"id": address_id},
             )
             if del_r is None or del_r.status_code != 200:
                 cleaned = False

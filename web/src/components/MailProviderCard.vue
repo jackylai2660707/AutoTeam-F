@@ -44,10 +44,10 @@
         <input
           v-model="form[baseUrlKey]"
           type="text"
-          :placeholder="form.MAIL_PROVIDER === 'maillab' ? 'https://your-maillab.example.com' : 'https://example.com/api'"
+          :placeholder="form.MAIL_PROVIDER === 'maillab' ? 'https://your-maillab.example.com' : 'https://cfmail.example.com 或 https://cfmail.example.com/admin'"
           class="w-full px-2 py-1.5 bg-surface border border-hairline rounded text-sm text-ink-950 focus-ring" />
         <p v-if="form.MAIL_PROVIDER !== 'maillab'" class="text-[11px] leading-relaxed text-ink-500">
-          cf_temp_email 的 CLOUDMAIL_BASE_URL 必须填写到 API 前缀，例如 https://your-domain.com/api。
+          cf_temp_email 可填写站点根路径或 /admin 后台地址；保存时会自动转成可调用 API 的根路径。
         </p>
         <input
           v-if="form.MAIL_PROVIDER === 'maillab'"
@@ -148,12 +148,6 @@ const canTestConnection = computed(() => {
   return baseOk && pwdOk
 })
 
-const cloudmailBaseUrlMissingApi = computed(() => {
-  if (form.value.MAIL_PROVIDER === 'maillab') return false
-  const value = String(form.value[baseUrlKey.value] || '').trim().replace(/\/+$/, '')
-  return !!value && !value.endsWith('/api')
-})
-
 const canEnterDomain = computed(() => state.value === 'DOMAIN' || state.value === 'SAVE')
 
 const connectionStatus = computed(() => {
@@ -190,6 +184,12 @@ function stripAt(d) {
   return (d || '').replace(/^@/, '').trim()
 }
 
+function normalizeCfTempEmailBaseUrl(value) {
+  let base = String(value || '').trim().replace(/\/+$/, '')
+  if (base.toLowerCase().endsWith('/admin')) base = base.slice(0, -6).replace(/\/+$/, '')
+  return base
+}
+
 function selectProvider(value) {
   form.value.MAIL_PROVIDER = value
   state.value = 'CONNECTION'
@@ -201,13 +201,8 @@ function selectProvider(value) {
 async function testConnection() {
   testing.value = true
   try {
-    if (cloudmailBaseUrlMissingApi.value) {
-      emit('error', {
-        error_code: 'ROUTE_NOT_FOUND',
-        message: 'CLOUDMAIL_BASE_URL 需要包含 /api',
-        hint: '请填写类似 https://your-domain.com/api 的地址，而不是只填域名根路径。',
-      })
-      return
+    if (form.value.MAIL_PROVIDER !== 'maillab') {
+      form.value[baseUrlKey.value] = normalizeCfTempEmailBaseUrl(form.value[baseUrlKey.value])
     }
     const fp = await api.probeMailProvider({
       provider: form.value.MAIL_PROVIDER,

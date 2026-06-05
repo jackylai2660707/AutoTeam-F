@@ -103,6 +103,7 @@ export const api = {
 
   getRegisterDomain: () => request('GET', '/config/register-domain'),
   setRegisterDomain: (domain, verify = true) => request('PUT', '/config/register-domain', { domain, verify }),
+  setRegisterDomains: (domains, verify = true) => request('PUT', '/config/register-domain', { domains, verify }),
 
   // SPEC-2 — 邀请席位偏好(default/codex)
   getPreferredSeatType: () => request('GET', '/config/preferred-seat-type'),

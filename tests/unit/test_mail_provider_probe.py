@@ -61,6 +61,25 @@ def test_fingerprint_detect_cf(monkeypatch):
     assert result.detected_provider == "cf_temp_email"
 
 
+def test_fingerprint_cf_accepts_admin_url(monkeypatch):
+    """用户贴 cf_temp_email /admin 后台地址时,probe 应自动转成 API 根路径。"""
+    seen_urls = []
+
+    def fake_get(url, **kw):
+        seen_urls.append(url)
+        if url == "https://cf.example.com/setting/websiteConfig":
+            return _Resp(None, status_code=404)
+        if url == "https://cf.example.com/admin/address":
+            return _Resp({"results": []})
+        return _Resp(None, status_code=404)
+
+    monkeypatch.setattr(mod.requests, "get", fake_get)
+    result = mod.probe_fingerprint("https://cf.example.com/admin", "cf_temp_email")
+    assert result.ok
+    assert result.detected_provider == "cf_temp_email"
+    assert "https://cf.example.com/admin/admin/address" not in seen_urls
+
+
 def test_fingerprint_provider_mismatch(monkeypatch):
     """provider=cf_temp_email 但服务器是 maillab → PROVIDER_MISMATCH。"""
 
@@ -166,6 +185,25 @@ def test_credentials_captcha_required(monkeypatch):
     assert ei.value.error_code == "CAPTCHA_REQUIRED"
 
 
+def test_credentials_cf_sends_address_pagination(monkeypatch):
+    """cf_temp_email /admin/address 需要 limit/offset,否则部分 Worker 会返回 Invalid limit。"""
+
+    def fake_get(url, **kw):
+        assert url == "https://cf.example.com/admin/address"
+        assert kw.get("params") == {"limit": 1, "offset": 0}
+        assert kw.get("headers", {}).get("x-admin-auth") == "secret"
+        return _Resp({"results": []})
+
+    monkeypatch.setattr(mod.requests, "get", fake_get)
+    result = mod.probe_credentials(
+        "https://cf.example.com/admin",
+        "cf_temp_email",
+        admin_password="secret",
+    )
+    assert result.ok
+    assert result.is_admin is True
+
+
 # ----------------------------------------------------------------- domain ownership
 
 
@@ -228,3 +266,28 @@ def test_domain_ownership_leaked_probe(monkeypatch):
     assert result.cleaned is False
     assert result.leaked_probe is not None
     assert result.leaked_probe["acct_id"] == 99
+
+
+def test_cf_domain_ownership_deletes_probe_by_path(monkeypatch):
+    """cf_temp_email 新版后台使用 /admin/delete_address/{id},不能用 query id。"""
+    deletes = []
+
+    def fake_post(url, **kw):
+        assert url == "https://cf.example.com/admin/new_address"
+        return _Resp({"address": "probe@x.com", "address_id": 123})
+
+    def fake_delete(url, **kw):
+        deletes.append(url)
+        return _Resp({"ok": True})
+
+    monkeypatch.setattr(mod.requests, "post", fake_post)
+    monkeypatch.setattr(mod.requests, "delete", fake_delete)
+    result = mod.probe_domain_ownership(
+        "https://cf.example.com/admin",
+        "cf_temp_email",
+        admin_password="secret",
+        domain="x.com",
+    )
+    assert result.ok
+    assert result.cleaned is True
+    assert deletes == ["https://cf.example.com/admin/delete_address/123"]
